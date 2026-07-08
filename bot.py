@@ -210,3 +210,28 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ... весь ваш код ...
+
+# --- Создание приложения бота (ГЛОБАЛЬНАЯ ПЕРЕМЕННАЯ) ---
+application = create_application()
+
+# --- Главная функция ---
+def main():
+    """Главная функция запуска бота"""
+    logger.info("🚀 Запуск бота...")
+
+    # Запускаем Flask сервер в отдельном потоке для Render
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    logger.info("🌐 Flask сервер запущен в фоновом режиме")
+
+    if application:
+        logger.info("✅ Бот успешно создан")
+        logger.info("🤖 Бот запущен и готов к работе!")
+        application.run_polling()
+    else:
+        logger.error("❌ Не удалось создать приложение бота")
+
+if __name__ == "__main__":
+    main()
