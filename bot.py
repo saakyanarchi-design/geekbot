@@ -1,10 +1,20 @@
+import asyncio
 import logging
+import json
 import os
-from datetime import datetime
-import gspread
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime, timedelta
+from typing import Dict, Optional
+
+import aiohttp
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+import pytz
+
+# --- Flask для Render ---
+from flask import Flask
+from threading import Thread
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -13,221 +23,190 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Настройки ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-GOOGLE_SHEETS_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
-SHEET_NAME = "Отчёты/ Срезы ОТБ Июль"
+# --- Конфигурация ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
+SPREADSHEET_ID = "1VEr06vI-UqFxhby6lUx5b9-KxOH4FX-EZ8SvrZ6Fks0"  # ID вашей таблицы
 
-# --- Подключение к Google Sheets ---
-def get_google_sheet():
+# --- Flask приложение для Render ---
+app_flask = Flask(__name__)
+
+@app_flask.route('/')
+def home():
+    return "Bot is running!"
+
+@app_flask.route('/health')
+def health():
+    return "OK", 200
+
+def run_flask():
+    """Запускаем Flask сервер в отдельном потоке"""
+    port = int(os.environ.get("PORT", 8080))
+    app_flask.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+# --- Инициализация Google Sheets ---
+def init_google_sheets():
+    """Инициализация клиента Google Sheets"""
     try:
-        # Если credentials переданы как строка JSON из переменной окружения
-        import json
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        client = gspread.authorize(creds)
-        sheet = client.open(SHEET_NAME)
+        if not GOOGLE_CREDENTIALS_JSON:
+            logger.error("❌ Не найдены GOOGLE_CREDENTIALS в переменных окружения!")
+            return None
+
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        creds = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        service = build('sheets', 'v4', credentials=creds)
+        sheet = service.spreadsheets()
         logger.info("✅ Успешное подключение к Google Sheets")
         return sheet
     except Exception as e:
         logger.error(f"❌ Ошибка подключения к Google Sheets: {e}")
         return None
 
-# --- Проверка, может ли пользователь сдать отчёт ---
-def check_can_submit_report(username):
+# --- Получение данных из таблицы ---
+def get_sheet_data():
+    """Получение данных из Google таблицы"""
     try:
-        # 1. Получаем имя сотрудника из листа "СПРАВОЧНИКИ"
-        sheet = get_google_sheet()
+        sheet = init_google_sheets()
         if not sheet:
-            return False, "❌ Ошибка подключения к базе данных."
+            return None
 
-        sheet_refs = sheet.worksheet("СПРАВОЧНИКИ")
-        all_refs = sheet_refs.get_all_values()
+        # Получаем данные из листа "Срез данных по состоянию на 06.07.2026"
+        result = sheet.values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range="'Срез данных по состоянию на 06.07.2026'!A:Z"
+        ).execute()
 
-        # Пропускаем заголовок (первая строка), если он есть
-        start_row = 1 if all_refs and all_refs[0][0] in ["Имя", "Сотрудник", ""] else 0
+        values = result.get('values', [])
 
-        user_name = None
-        for row in all_refs[start_row:]:
-            if len(row) > 1 and row[1].strip() == username:  # колонка B (никнейм)
-                user_name = row[0].strip()  # колонка A (имя)
-                break
+        if not values:
+            logger.warning("⚠️ Таблица пуста или данные не найдены")
+            return None
 
-        if not user_name:
-            return False, "❌ Вы не найдены в базе или ваш никнейм не привязан."
-
-        logger.info(f"✅ Найден сотрудник: {user_name}")
-
-        # 2. Проверяем график на сегодня
-        sheet_graph = sheet.worksheet("График")
-        data = sheet_graph.get_all_values()
-
-        if not data or len(data) < 2:
-            return False, "❌ Ошибка: лист 'График' пуст или содержит недостаточно данных."
-
-        # Заголовки (первая строка) - дни месяца
-        headers = data[0]
-        today_day = str(datetime.now().day)  # сегодня 8-е число
-
-        # Ищем колонку с сегодняшним числом
-        col_index = -1
-        for i, h in enumerate(headers):
-            if h and h.strip() == today_day:
-                col_index = i
-                break
-
-        if col_index == -1:
-            return False, f"❌ Ошибка: в таблице не найдена колонка с датой '{today_day}'."
-
-        # Ищем строку с именем сотрудника
-        row_index = -1
-        for i, row in enumerate(data):
-            if row and row[0].strip() == user_name:
-                row_index = i
-                break
-
-        if row_index == -1:
-            return False, f"❌ Вы ({user_name}) не найдены в списке на листе 'График'."
-
-        # 3. Проверяем значение ячейки (чекбокс)
-        cell_value = data[row_index][col_index].strip() if col_index < len(data[row_index]) else "FALSE"
-
-        # Чекбокс может быть "TRUE", "True", True или просто "1"
-        if cell_value in ["TRUE", "True", "true", "1", True]:
-            return True, f"✅ Вы на смене, {user_name}! Нажмите кнопку ниже, чтобы начать отчёт."
-        else:
-            return False, f"⛔ Сегодня у вас нет смены по графику (галочка не отмечена)."
+        logger.info(f"✅ Получено {len(values)} строк данных")
+        return values
 
     except Exception as e:
-        logger.error(f"❌ Ошибка проверки: {e}")
-        return False, f"❌ Произошла ошибка при проверке графика: {str(e)}"
+        logger.error(f"❌ Ошибка получения данных из таблицы: {e}")
+        return None
 
-# --- Команда /start ---
+# --- Обработчики команд ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
     user = update.effective_user
-    username = user.username
-
-    logger.info(f"Пользователь @{username} запустил /start")
-
-    if not username:
-        await update.message.reply_text(
-            "❌ У вас не установлен username в Telegram.\n"
-            "Пожалуйста, установите его в настройках Telegram и попробуйте снова."
-        )
-        return
-
-    # Клавиатура с главными кнопками
-    keyboard = [
-        [KeyboardButton("✅ Сдать отчёт")],
-        [KeyboardButton("❓ Помощь")]
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-    await update.message.reply_text(
-        f"👋 Привет, {user.first_name}!\n"
-        f"Я бот для сдачи отчётов.\n\n"
-        f"Нажмите «✅ Сдать отчёт», чтобы начать.",
-        reply_markup=reply_markup
+    welcome_message = (
+        f"👋 Привет, {user.first_name}!\n\n"
+        f"🤖 Я бот для работы с отчётами ОТБ.\n\n"
+        f"📋 Доступные команды:\n"
+        f"• /report - получить текущий отчёт\n"
+        f"• /start - показать это сообщение\n\n"
+        f"💡 Просто отправьте /report, чтобы получить актуальные данные!"
     )
+    await update.message.reply_text(welcome_message)
 
-# --- Команда /report ---
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.effective_user.username
+    """Обработчик команды /report"""
+    await update.message.reply_text("📊 Загружаю данные из Google Sheets...")
 
-    if not username:
-        await update.message.reply_text("❌ У вас не установлен username в Telegram.")
-        return
+    try:
+        data = get_sheet_data()
 
-    can_report, message = check_can_submit_report(username)
+        if not data:
+            await update.message.reply_text(
+                "❌ Не удалось получить данные из таблицы.\n"
+                "Проверьте подключение к Google Sheets."
+            )
+            return
 
-    if can_report:
-        # Создаем инлайн-клавиатуру для подтверждения
-        keyboard = [
-            [InlineKeyboardButton("✅ Да, я на смене", callback_data='confirm_report')],
-            [InlineKeyboardButton("❌ Отмена", callback_data='cancel_report')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(
-            message,
-            reply_markup=reply_markup
+        # TODO: Здесь будет логика форматирования отчёта
+        # Пока просто показываем количество строк
+        report_text = (
+            f"📊 Отчёт ОТБ\n"
+            f"📅 Дата: {datetime.now(pytz.timezone('Europe/Moscow')).strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"✅ Данные получены\n"
+            f"📈 Всего записей: {len(data) - 1} (без заголовка)\n\n"
+            f"⚙️ Расширенный функционал в разработке..."
         )
-    else:
-        await update.message.reply_text(message)
 
-# --- Обработка нажатий на инлайн-кнопки ---
+        await update.message.reply_text(report_text)
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка в команде /report: {e}")
+        await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки"""
     query = update.callback_query
     await query.answer()
 
-    if query.data == 'confirm_report':
-        await query.edit_message_text(text="📝 Отлично! Начинаем сдачу отчёта...\n\n(Здесь будет логика сбора данных)")
-        # Здесь можно добавить дальнейшую логику сбора отчёта
-    elif query.data == 'cancel_report':
-        await query.edit_message_text(text="❌ Отчёт отменён.")
+    if query.data == "refresh":
+        await query.edit_message_text("🔄 Обновляю данные...")
+        data = get_sheet_data()
+        if data:
+            await query.edit_message_text(
+                f"✅ Данные обновлены!\n"
+                f"📊 Всего записей: {len(data) - 1}"
+            )
+        else:
+            await query.edit_message_text("❌ Не удалось обновить данные")
 
-# --- Обработка текстовых сообщений ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    username = update.effective_user.username
+    """Обработчик обычных сообщений"""
+    await update.message.reply_text(
+        "🤖 Я вас не понял.\n"
+        "Используйте команды:\n"
+        "• /start - приветствие\n"
+        "• /report - получить отчёт"
+    )
 
-    if text == "✅ Сдать отчёт":
-        if not username:
-            await update.message.reply_text("❌ У вас не установлен username в Telegram.")
-            return
-
-        can_report, message = check_can_submit_report(username)
-        await update.message.reply_text(message)
-
-    elif text == "❓ Помощь":
-        await update.message.reply_text(
-            "ℹ️ Как пользоваться ботом:\n\n"
-            "1. Убедитесь, что у вас установлен username в Telegram\n"
-            "2. Ваш username должен совпадать с никнеймом в таблице (лист 'СПРАВОЧНИКИ')\n"
-            "3. Нажмите «✅ Сдать отчёт»\n"
-            "4. Бот проверит вашу смену по графику\n"
-            "5. Если всё ОК — можно сдавать отчёт\n\n"
-            "Если возникли проблемы — обратитесь к администратору."
-        )
-    else:
-        await update.message.reply_text(
-            "Используйте кнопки внизу экрана:\n"
-            "✅ Сдать отчёт — проверить график и начать отчёт\n"
-            "❓ Помощь — инструкция"
-        )
-
-# --- Обработка ошибок ---
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Ошибка: {context.error}")
+    """Обработчик ошибок"""
+    logger.error(f"❌ Ошибка: {context.error}")
     if update and update.effective_message:
         await update.effective_message.reply_text(
-            "❌ Произошла ошибка. Попробуйте позже."
+            "❌ Произошла ошибка. Пожалуйста, попробуйте позже."
         )
+
+# --- Создание приложения бота ---
+def create_application():
+    """Создание и настройка приложения бота"""
+    if not BOT_TOKEN:
+        logger.error("❌ Не указан BOT_TOKEN в переменных окружения!")
+        return None
+
+    # Создаем приложение
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Регистрируем обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("report", report))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_error_handler(error_handler)
+
+    return application
 
 # --- Главная функция ---
 def main():
-    if not BOT_TOKEN:
-        logger.error("❌ Не указан BOT_TOKEN в переменных окружения!")
-        return
+    """Главная функция запуска бота"""
+    logger.info("🚀 Запуск бота...")
 
-    if not GOOGLE_SHEETS_CREDENTIALS:
-        logger.error("❌ Не указаны GOOGLE_CREDENTIALS в переменных окружения!")
-        return
+    # Запускаем Flask сервер в отдельном потоке для Render
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    logger.info("🌐 Flask сервер запущен в фоновом режиме")
 
-    # Создаем приложение
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Регистрируем обработчики
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("report", report))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error_handler)
-
-    # Запускаем бота
-    logger.info("🚀 Бот запущен и готов к работе!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Создаем и запускаем бота
+    application = create_application()
+    if application:
+        logger.info("✅ Бот успешно создан")
+        logger.info("🤖 Бот запущен и готов к работе!")
+        application.run_polling()
+    else:
+        logger.error("❌ Не удалось создать приложение бота")
 
 if __name__ == "__main__":
     main()
