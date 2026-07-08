@@ -40,7 +40,7 @@ def health():
     return "OK", 200
 
 def run_flask():
-    """Запускаем Flask сервер в отдельном потоке"""
+    """Запускаем Flask сервер"""
     port = int(os.environ.get("PORT", 8080))
     app_flask.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
@@ -183,16 +183,14 @@ def create_application():
 
     return application
 
-# --- Главная функция ---
-def main():
-    """Главная функция запуска бота"""
+# --- Главная асинхронная функция ---
+async def main():
+    """Основная асинхронная функция запуска"""
     logger.info("🚀 Запуск бота...")
 
-    # 1. Запускаем Flask в фоновом потоке
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    logger.info("🌐 Flask сервер запущен на порту {}".format(os.environ.get("PORT", 8080)))
+    # 1. Запускаем Flask в отдельном потоке (через asyncio.to_thread)
+    flask_task = asyncio.to_thread(run_flask)
+    logger.info(f"🌐 Flask сервер запущен на порту {os.environ.get('PORT', 8080)}")
 
     # 2. Создаем приложение Telegram бота
     application = create_application()
@@ -204,8 +202,19 @@ def main():
     logger.info("✅ Бот успешно создан")
     logger.info("🤖 Бот запущен и готов к работе!")
 
-    # 3. Запускаем polling
-    application.run_polling(drop_pending_updates=True)
+    # 3. Запускаем бота
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
+
+    # Держим бота активным
+    try:
+        # Бесконечное ожидание (бот работает, пока не остановят)
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("🛑 Бот остановлен")
+        await application.stop()
 
 if __name__ == "__main__":
-    main()
+    # Используем asyncio.run для корректной работы event loop
+    asyncio.run(main())
