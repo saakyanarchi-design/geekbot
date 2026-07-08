@@ -3,31 +3,26 @@ import asyncio
 import datetime
 import logging
 import os
-import json
+import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import List, Dict, Optional
 
-# Библиотеки Google
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 from google.oauth2 import service_account
 
-# Библиотеки Telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, 
-    CommandHandler, 
-    CallbackQueryHandler, 
-    MessageHandler, 
-    filters, 
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
     ContextTypes
 )
-
-# Планировщик
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ---------------------------------------------------------
-# НАСТРОЙКИ ЛОГИРОВАНИЯ
+# ЛОГИРОВАНИЕ
 # ---------------------------------------------------------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -36,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------
-# НАСТРОЙКИ БОТА
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # ---------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID", "-1003813207765"))
@@ -45,84 +40,85 @@ REF_SHEET_NAME = "СПРАВОЧНИКИ"
 SCHEDULE_SHEET_NAME = "График"
 
 # ---------------------------------------------------------
-# ПОДГОТОВКА GOOGLE SHEETS
+# GOOGLE SHEETS
 # ---------------------------------------------------------
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-client = None
 
 def init_google_sheets():
-    """Инициализация Google Sheets API из переменных окружения"""
+    """Инициализация Google Sheets API"""
     try:
         SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-        creds_dict = {
-            "type": "service_account",
-            "project_id": os.getenv("PROJECT_ID"),
-            "private_key_id": os.getenv("PRIVATE_KEY_ID"),
-            "private_key": os.getenv("PRIVATE_KEY").replace("\\n", "\n") if os.getenv("PRIVATE_KEY") else None,
-            "client_email": os.getenv("CLIENT_EMAIL"),
-            "client_id": os.getenv("CLIENT_ID"),
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_x509_cert_url": os.getenv("CLIENT_CERT_URL") or os.getenv("CLIENT_X509_CERT_URL")
 
-        }
+        # Читаем JSON из переменной GOOGLE_CREDENTIALS (если есть)
+        creds_json = os.getenv("GOOGLE_CREDENTIALS")
+        if creds_json:
+            creds_dict = json.loads(creds_json)
+        else:
+            creds_dict = {
+                "type": "service_account",
+                "project_id": os.getenv("PROJECT_ID"),
+                "private_key_id": os.getenv("PRIVATE_KEY_ID"),
+                "private_key": os.getenv("PRIVATE_KEY").replace("\\n", "\n") if os.getenv("PRIVATE_KEY") else None,
+                "client_email": os.getenv("CLIENT_EMAIL"),
+                "client_id": os.getenv("CLIENT_ID"),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                "client_x509_cert_url": os.getenv("CLIENT_CERT_URL") or os.getenv("CLIENT_X509_CERT_URL")
+            }
 
-        # Проверка обязательных полей
-        required_fields = ["private_key", "client_email", "client_id"]
-        missing = [f for f in required_fields if not creds_dict[f]]
+        required = ["private_key", "client_email", "client_id"]
+        missing = [f for f in required if not creds_dict.get(f)]
         if missing:
-            logger.error(f"Missing required credentials: {', '.join(missing)}")
+            logger.error(f"Нет credentials: {', '.join(missing)}")
             return None
 
-        creds = service_account.Credentials.from_service_account_info(
-            creds_dict, scopes=SCOPES)
+        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         client = gspread.authorize(creds)
 
         spreadsheet_id = os.getenv("SPREADSHEET_ID")
         if not spreadsheet_id:
-            logger.error("SPREADSHEET_ID not set")
+            logger.error("SPREADSHEET_ID не задан")
             return None
 
         sheet = client.open_by_key(spreadsheet_id)
-        logger.info(f"Connected to spreadsheet: {sheet.title}")
+        logger.info(f"Подключено к таблице: {sheet.title}")
         return sheet
     except Exception as e:
-        logger.error(f"Google Sheets init error: {e}", exc_info=True)
+        logger.error(f"Ошибка Google Sheets: {e}", exc_info=True)
         return None
 
+# Глобальный клиент
+client = None
+
 def get_spreadsheet():
-    """получение таблицы по имени"""
-    if not client:
+    global client
+    if client is None:
+        logger.info("Инициализируем Google Sheets клиент...")
         init_google_sheets()
-    if not client:
+    if client is None:
+        logger.error("Клиент не инициализирован")
         return None
     try:
         return client.open(SPREADSHEET_NAME)
-    except gspread.exceptions.SpreadsheetNotFound:
-        logger.error(f"❌ Не найдена таблица: {SPREADSHEET_NAME}")
-        return None
     except Exception as e:
-        logger.error(f"❌ Ошибка открытия таблицы: {e}")
+        logger.error(f"Не могу открыть таблицу: {e}")
         return None
 
 # ---------------------------------------------------------
-# ЛОГИКА ПОЛУЧЕНИЯ АКТИВНЫХ МЕНЕДЖЕРОВ
+# ПОЛУЧЕНИЕ МЕНЕДЖЕРОВ И ДАННЫХ
 # ---------------------------------------------------------
 
 def get_active_managers_for_today() -> List[Dict[str, str]]:
-    """получение списка активных менеджеров на сегодня по графику"""
     try:
         spreadsheet = get_spreadsheet()
         if not spreadsheet:
             return []
 
-        # Читаем справочник
         ref_sheet = spreadsheet.worksheet(REF_SHEET_NAME)
         ref_data = ref_sheet.get_all_values()
 
         candidates = []
-        for row in ref_data[1:]:  # Пропускаем заголовок
+        for row in ref_data[1:]:
             if len(row) >= 2 and row[0] and row[1]:
                 candidates.append({
                     "full_name": row[0].strip(),
@@ -130,123 +126,102 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
                 })
 
         if not candidates:
-            logger.warning("Не найдено активных менеджеров в справочнике.")
+            logger.warning("Нет кандидатов в справочнике")
             return []
 
-        # Читаем график
         schedule_sheet = spreadsheet.worksheet(SCHEDULE_SHEET_NAME)
         schedule_data = schedule_sheet.get_all_values()
         if not schedule_data:
-            logger.warning("Лист 'График' пуст")
             return []
 
-        today_str = str(datetime.datetime.now().day)  # "8" вместо "08"
-        header_row = schedule_data[0]
-        target_col_index = -1
+        today = datetime.datetime.now()
+        today_str = str(today.day)
 
-        for idx, val in enumerate(header_row):
-            clean_val = str(val).strip()
-            if clean_val == today_str:
-                target_col_index = idx
+        header = schedule_data[0]
+        col_idx = -1
+        for i, val in enumerate(header):
+            if str(val).strip() == today_str:
+                col_idx = i
                 break
 
-        if target_col_index == -1:
-            logger.warning(f"Не найдена колонка с датой {today_str}")
+        if col_idx == -1:
+            logger.warning(f"Колонка даты {today_str} не найдена")
             return []
 
-        # Строим карту статусов
         schedule_map = {}
         for row in schedule_data[1:]:
-            if len(row) > target_col_index:
-                name = row[0].strip() if row[0] else ""
-                status_cell = row[target_col_index] if target_col_index < len(row) else ""
-                is_working = str(status_cell).strip().lower() in ["true", "1", "да", "✓", "✔"]
+            if len(row) > col_idx:
+                name = row[0].strip()
+                val = str(row[col_idx]).strip().lower()
+                is_working = val in ["true", "1", "да", "✓", "✔", "yes"]
                 schedule_map[name] = is_working
 
-        # Фильтруем кандидатов
-        active_managers = []
+        active = []
         for cand in candidates:
             if schedule_map.get(cand["full_name"], False):
-                active_managers.append(cand)
+                active.append(cand)
 
-        return active_managers
-
+        return active
     except Exception as e:
-        logger.error(f"Ошибка при получении списка менеджеров: {e}")
+        logger.error(f"Ошибка get_active_managers: {e}")
         return []
 
-# ---------------------------------------------------------
-# ПОЛУЧЕНИЕ ДАННЫХ МЕНЕДЖЕРА С ЛИСТА ДНЯ
-# ---------------------------------------------------------
-
 def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
-    """получение данных менеджера с листа текущего дня"""
     try:
         spreadsheet = get_spreadsheet()
         if not spreadsheet:
             return None
 
-        # Определяем имя листа дня
-        day_num = datetime.datetime.now().day  # Без ведущего нуля: "8", "15"
-        day_sheet_name = str(day_num)
+        now = datetime.datetime.now()
+        sheet_name = str(now.day)
 
-        # Пробуем открыть лист с числом, если нет - пробуем с нулем
         try:
-            day_sheet = spreadsheet.worksheet(day_sheet_name)
+            day_sheet = spreadsheet.worksheet(sheet_name)
         except gspread.exceptions.WorksheetNotFound:
-            # Пробуем с ведущим нулем
-            day_sheet_name = f"{day_num:02d}"  # "08", "15"
+            sheet_name = f"{now.day:02d}"
             try:
-                day_sheet = spreadsheet.worksheet(day_sheet_name)
+                day_sheet = spreadsheet.worksheet(sheet_name)
             except gspread.exceptions.WorksheetNotFound:
-                logger.warning(f"Не найден лист с датой: {day_num} или {day_num:02d}")
+                logger.warning(f"Нет листа: {now.day} / {now.day:02d}")
                 return None
 
-        # Получаем все данные с листа
         all_data = day_sheet.get_all_values()
-
-        # Ищем строку менеджера (первая колонка - имя)
         row_num = None
-        for idx, row in enumerate(all_data):
+        for i, row in enumerate(all_data):
             if row and row[0].strip().lower() == full_name.lower():
-                row_num = idx
+                row_num = i
                 break
 
         if row_num is None:
-            logger.warning(f"Менеджер {full_name} не найден на листе {day_sheet_name}")
+            logger.warning(f"{full_name} не найден на листе")
             return None
 
-        # Индексы столбцов (0-индексация):
-        # B=1, C=2, D=3, E=4, F=5, G=6, H=7, I=8, J=9, K=10, L=11
-        def safe_get(row_data, col_idx, default="0"):
-            if col_idx < len(row_data):
-                val = row_data[col_idx].strip()
-                return val if val else default
+        def safe(row, col, default="0"):
+            if col < len(row):
+                v = row[col].strip()
+                return v if v else default
             return default
 
-        target_row = all_data[row_num]
-
+        target = all_data[row_num]
         return {
             "full_name": full_name,
-            "leads": safe_get(target_row, 1),     # B - Лиды
-            "calls": safe_get(target_row, 2),     # C - Звонки
-            "mailing": safe_get(target_row, 3),   # D - Рассылка
-            "vk_requests": safe_get(target_row, 4),   # E - ВК запросы
-            "vk_checks": safe_get(target_row, 5),     # F - ВК проверки
-            "deadlines": safe_get(target_row, 6),     # G - Дедлайны
-            "invoices": safe_get(target_row, 7),      # H - Счета
-            "payments_count": safe_get(target_row, 8), # I - Кол-во оплат
-            "payments_sum": safe_get(target_row, 9),   # J - Сумма оплат
-            "cvr": safe_get(target_row, 10),           # K - CVR
-            "non_quality": safe_get(target_row, 11)    # L - Некачественные
+            "leads": safe(target, 1),
+            "calls": safe(target, 2),
+            "mailing": safe(target, 3),
+            "vk_requests": safe(target, 4),
+            "vk_checks": safe(target, 5),
+            "deadlines": safe(target, 6),
+            "invoices": safe(target, 7),
+            "payments_count": safe(target, 8),
+            "payments_sum": safe(target, 9),
+            "cvr": safe(target, 10),
+            "non_quality": safe(target, 11)
         }
-
     except Exception as e:
-        logger.error(f"Ошибка получения данных менеджера: {e}")
+        logger.error(f"get_manager_day_data error: {e}")
         return None
 
 def format_manager_report(data: Dict[str, str]) -> str:
-    """Форматирование отчета менеджера для отправки"""
     return (
         f"📊 <b>ОТЧЕТ ПРИНЯТ</b>\n"
         f"──────────────────────\n"
@@ -267,11 +242,10 @@ def format_manager_report(data: Dict[str, str]) -> str:
     )
 
 # ---------------------------------------------------------
-# ОБРАБОТЧИКИ КОМАНД
+# ХЕНДЛЕРЫ
 # ---------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик /start с кнопкой отчета в ЛС"""
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Сдать отчёт", callback_data="submit_report")]
     ])
@@ -282,21 +256,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик /report - кнопка отчета"""
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Сдать отчёт", callback_data="submit_report")]
     ])
     await update.message.reply_text("📊 Нажмите кнопку, чтобы сдать отчёт:", reply_markup=kb)
 
 async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопки 'Сдать отчёт'"""
     query = update.callback_query
     await query.answer()
 
     user = query.from_user
     username = user.username
 
-    # Проверка username
     if not username:
         await query.edit_message_text(
             "❌ <b>Ошибка!</b>\n\nУ вас не заполнен Username в Telegram.\n"
@@ -305,7 +276,6 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    # Проверяем доступ к таблице
     spreadsheet = get_spreadsheet()
     if not spreadsheet:
         await query.edit_message_text(
@@ -316,7 +286,6 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         return
 
     try:
-        # Ищем менеджера по username в справочнике
         ref_sheet = spreadsheet.worksheet(REF_SHEET_NAME)
         ref_data = ref_sheet.get_all_values()
 
@@ -337,7 +306,6 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             )
             return
 
-        # Проверка графика работы
         active_managers = get_active_managers_for_today()
         is_on_shift = any(m["full_name"] == full_name for m in active_managers)
 
@@ -350,7 +318,6 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             )
             return
 
-        # Получаем данные с листа дня
         manager_data = get_manager_day_data(full_name)
 
         if not manager_data:
@@ -362,7 +329,6 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             )
             return
 
-        # Отправляем отчет в группу
         report_text = format_manager_report(manager_data)
         await context.bot.send_message(
             chat_id=CHAT_ID,
@@ -370,7 +336,6 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             parse_mode='HTML'
         )
 
-        # Подтверждение в ЛС
         current_time = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
         await query.edit_message_text(
             f"✅ <b>Отчёт успешно отправлен!</b>\n\n"
@@ -387,13 +352,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             parse_mode='HTML'
         )
 
-async def process_report_responses(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений"""
-    # Ваша логика обработки текстовых ответов
-    pass
-
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ошибок"""
     logger.error(f"Ошибка: {context.error}")
     try:
         if update and update.effective_message:
@@ -404,22 +363,19 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Не удалось отправить сообщение об ошибке: {e}")
 
 # ---------------------------------------------------------
-# ПЛАНИРОВЩИК
+# НАПОМИНАНИЕ
 # ---------------------------------------------------------
 
 async def send_reminder(bot):
-    """Отправка напоминания в группу с кнопкой"""
     try:
         managers = get_active_managers_for_today()
         if not managers:
-            logger.info("Сегодня нет активных менеджеров, напоминание не отправлено")
+            logger.info("Нет активных менеджеров — напоминание не отправлено")
             return
 
-        # Создаем упоминания
         mentions = "\n".join([f"• {m['full_name']} (@{m['username']})" for m in managers])
         mention_tags = " ".join([f"@{m['username']}" for m in managers])
 
-        # Кнопка для отчета
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Сдать отчёт", callback_data="submit_report")]
         ])
@@ -438,25 +394,23 @@ async def send_reminder(bot):
             reply_markup=kb
         )
         logger.info(f"Напоминание отправлено. Менеджеров: {len(managers)}")
-
     except Exception as e:
-        logger.error(f"Ошибка в напоминалке: {e}")
+        logger.error(f"Ошибка в send_reminder: {e}")
 
 # ---------------------------------------------------------
-# ЗАПУСК БОТА
+# ЗАПУСК
 # ---------------------------------------------------------
 
 async def main_async():
-    """Асинхронная главная функция запуска"""
     logger.info("🚀 Запуск бота...")
 
-    # Проверяем токен
     if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN не найден в переменных окружения!")
-        return
+        logger.error("❌ BOT_TOKEN не найден!")
+        sys.exit(1)
 
     # Инициализируем Google Sheets
-    init_google_sheets()
+    global client
+    client = init_google_sheets()
 
     # Создаём приложение
     application = Application.builder().token(BOT_TOKEN).build()
@@ -465,41 +419,34 @@ async def main_async():
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("report", cmd_report))
     application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="submit_report"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_report_responses))
     application.add_error_handler(error_handler)
 
-    # Настраиваем планировщик (московское время)
+    # Планировщик (МСК)
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(
-        send_reminder,
-        'cron',
-        hour=14,
-        minute=50,
-        args=[application.bot],
-        id="reminder_14_50"
-    )
-    scheduler.add_job(
-        send_reminder,
-        'cron',
-        hour=19,
-        minute=30,
-        args=[application.bot],
-        id="reminder_19_30"
-    )
+    scheduler.add_job(send_reminder, 'cron', hour=14, minute=50, args=[application.bot])
+    scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
     scheduler.start()
-    logger.info("✅ Планировщик запущен (напоминания в 14:50 и 19:30)")
+    logger.info("✅ Планировщик запущен (14:50, 19:30 МСК)")
 
-    # Запускаем бота
-    logger.info("🤖 Бот запущен и готов к работе!")
+    # Самый важный момент: сбрасываем старые сессии до старта
+    # Это решит конфликт getUpdates
+    try:
+        # Принудительно удаляем вебхук (если был)
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook удалён, все ожидающие обновления сброшены")
+    except Exception as e:
+        logger.warning(f"Не удалось удалить webhook: {e}")
 
+    # Запускаем поллинг СРАЗУ с drop_pending_updates=True
     await application.initialize()
     await application.start()
     await application.updater.start_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
+        drop_pending_updates=True  # <-- ВАЖНО: сбрасывает очередь
     )
 
-    # Держим бота запущенным
+    logger.info("🤖 Бот успешно запущен!")
+
     try:
         while True:
             await asyncio.sleep(3600)
@@ -508,26 +455,25 @@ async def main_async():
         await application.shutdown()
 
 def main():
-    """Синхронная обертка для запуска асинхронного кода"""
-    # Запускаем микро-сервер для Render
-    def run_dummy_server():
-        class HealthCheckHandler(BaseHTTPRequestHandler):
-            def log_message(self, format, *args): 
-                pass  # Отключает лишний спам в логах
+    """Микро-сервер для Render + запуск бота"""
+    def run_server():
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
             def do_GET(self):
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b"OK")
-            def do_HEAD(self):
-                self.send_response(200)
-                self.end_headers()
 
-        server = HTTPServer(('0.0.0.0', int(os.getenv("PORT", 10000))), HealthCheckHandler)
+        port = int(os.getenv("PORT", 10000))
+        server = HTTPServer(('0.0.0.0', port), Handler)
+        logger.info(f"Health check server on port {port}")
         server.serve_forever()
 
-    threading.Thread(target=run_dummy_server, daemon=True).start()
-
+    threading.Thread(target=run_server, daemon=True).start()
     asyncio.run(main_async())
 
 if __name__ == "__main__":
+    # Убедимся что import json есть
+    import json
     main()
