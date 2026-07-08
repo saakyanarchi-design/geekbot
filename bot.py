@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # --- Конфигурация ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
-SPREADSHEET_ID = "1VEr06vI-UqFxhby6lUx5b9-KxOH4FX-EZ8SvrZ6Fks0"  # ID вашей таблицы
+SPREADSHEET_ID = "1VEr06vI-UqFxhby6lUx5b9-KxOH4FX-EZ8SvrZ6Fks0"
 
 # --- Flask приложение для Render ---
 app_flask = Flask(__name__)
@@ -73,7 +73,6 @@ def get_sheet_data():
         if not sheet:
             return None
 
-        # Получаем данные из листа "Срез данных по состоянию на 06.07.2026"
         result = sheet.values().get(
             spreadsheetId=SPREADSHEET_ID,
             range="'Срез данных по состоянию на 06.07.2026'!A:Z"
@@ -120,8 +119,6 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # TODO: Здесь будет логика форматирования отчёта
-        # Пока просто показываем количество строк
         report_text = (
             f"📊 Отчёт ОТБ\n"
             f"📅 Дата: {datetime.now(pytz.timezone('Europe/Moscow')).strftime('%d.%m.%Y %H:%M')}\n\n"
@@ -176,10 +173,8 @@ def create_application():
         logger.error("❌ Не указан BOT_TOKEN в переменных окружения!")
         return None
 
-    # Создаем приложение
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Регистрируем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("report", report))
     application.add_handler(CallbackQueryHandler(button_callback))
@@ -193,45 +188,24 @@ def main():
     """Главная функция запуска бота"""
     logger.info("🚀 Запуск бота...")
 
-    # Запускаем Flask сервер в отдельном потоке для Render
+    # 1. Запускаем Flask в фоновом потоке
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
-    logger.info("🌐 Flask сервер запущен в фоновом режиме")
+    logger.info("🌐 Flask сервер запущен на порту {}".format(os.environ.get("PORT", 8080)))
 
-    # Создаем и запускаем бота
+    # 2. Создаем приложение Telegram бота
     application = create_application()
-    if application:
-        logger.info("✅ Бот успешно создан")
-        logger.info("🤖 Бот запущен и готов к работе!")
-        application.run_polling()
-    else:
+
+    if not application:
         logger.error("❌ Не удалось создать приложение бота")
+        return
 
-if __name__ == "__main__":
-    main()
-# ... весь ваш код ...
+    logger.info("✅ Бот успешно создан")
+    logger.info("🤖 Бот запущен и готов к работе!")
 
-# --- Создание приложения бота (ГЛОБАЛЬНАЯ ПЕРЕМЕННАЯ) ---
-application = create_application()
-
-# --- Главная функция ---
-def main():
-    """Главная функция запуска бота"""
-    logger.info("🚀 Запуск бота...")
-
-    # Запускаем Flask сервер в отдельном потоке для Render
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    logger.info("🌐 Flask сервер запущен в фоновом режиме")
-
-    if application:
-        logger.info("✅ Бот успешно создан")
-        logger.info("🤖 Бот запущен и готов к работе!")
-        application.run_polling()
-    else:
-        logger.error("❌ Не удалось создать приложение бота")
+    # 3. Запускаем polling
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
