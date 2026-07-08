@@ -9,6 +9,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiohttp import web
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -25,6 +26,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHAT_ID = int(os.getenv('CHAT_ID')) if os.getenv('CHAT_ID') else None
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 RANGE_NAME = os.getenv('RANGE_NAME', 'A:Z')
+PORT = int(os.getenv('PORT', 8080))
 
 # --- Собираем словарь для Google Credentials ---
 creds_dict = {
@@ -39,6 +41,21 @@ creds_dict = {
     "auth_provider_x509_cert_url": os.getenv("AUTH_PROVIDER_CERT_URL"),
     "client_x509_cert_url": os.getenv("CLIENT_CERT_URL"),
 }
+
+# ========================= ВЕБ-СЕРВЕР ДЛЯ RENDER =========================
+async def handle_health(request):
+    """Обработчик для проверки здоровья сервиса Render."""
+    return web.Response(text="GeekBot is running!")
+
+async def start_web_server():
+    """Запускает минимальный веб-сервер для Health Check Render."""
+    app = web.Application()
+    app.router.add_get('/', handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"Веб-сервер запущен на порту {PORT}")
 
 # ========================= ФУНКЦИЯ ДЛЯ ТАБЛИЦЫ =========================
 def get_sheet_data():
@@ -91,21 +108,24 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 async def main():
     """Основная асинхронная функция запуска бота."""
     try:
-        # Создаем приложение
+        # Сначала запускаем веб-сервер для Health Check Render
+        await start_web_server()
+
+        # Создаем приложение Telegram бота
         app = Application.builder().token(BOT_TOKEN).build()
 
         # Регистрируем команды
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("get_data", get_data))
 
-        # ПРАВИЛЬНЫЙ ЗАПУСК ПЛАНИРОВЩИКА ВНУТРИ ASYNC
+        # Запускаем планировщик
         scheduler = AsyncIOScheduler(timezone=str(MOSCOW_TZ))
         scheduler.add_job(check_reminders, 'interval', minutes=5, args=[app])
         scheduler.start()
 
         logger.info("Бот запущен и готов к работе!")
 
-        # Запускаем бота через run_polling
+        # Запускаем бота через polling
         await app.initialize()
         await app.start()
         await app.updater.start_polling()
