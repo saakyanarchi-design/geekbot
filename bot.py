@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from datetime import datetime, timedelta
 import pytz
 import requests
@@ -87,20 +88,34 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # ========================= ГЛАВНАЯ ФУНКЦИЯ =========================
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+async def main():
+    """Основная асинхронная функция запуска бота."""
+    try:
+        # Создаем приложение
+        app = Application.builder().token(BOT_TOKEN).build()
 
-    # Регистрируем команды
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("get_data", get_data))
+        # Регистрируем команды
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("get_data", get_data))
 
-    # Планировщик (проверка каждые 5 минут)
-    scheduler = AsyncIOScheduler(timezone=str(MOSCOW_TZ))
-    scheduler.add_job(check_reminders, 'interval', minutes=5, args=[app])
-    scheduler.start()
+        # ПРАВИЛЬНЫЙ ЗАПУСК ПЛАНИРОВЩИКА ВНУТРИ ASYNC
+        scheduler = AsyncIOScheduler(timezone=str(MOSCOW_TZ))
+        scheduler.add_job(check_reminders, 'interval', minutes=5, args=[app])
+        scheduler.start()
 
-    logger.info("Бот запущен и готов к работе!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("Бот запущен и готов к работе!")
+
+        # Запускаем бота через run_polling
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+
+        # Держим бота запущенным
+        await asyncio.Event().wait()
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка при запуске бота: {e}")
+        raise
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
