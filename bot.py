@@ -1,9 +1,11 @@
+import threading
 import asyncio
 import datetime
 import logging
 import os
 import json
 import gspread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from google.oauth2 import service_account
 from typing import List, Dict, Optional
 from google.oauth2 import service_account
@@ -489,6 +491,16 @@ async def main_async():
         await application.shutdown()
 
 def main():
+        # Добавляем этот блок:
+ def run_dummy_server():
+        server = HTTPServer(('0.0.0.0', int(os.getenv("PORT", 10000))), BaseHTTPRequestHandler)
+        server.serve_forever()
+
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+    # -------------------
+
+    asyncio.run(main_async())
+
     """Синхронная обертка для запуска асинхронного кода"""
     asyncio.run(main_async())  # ✅ Явно создаем event loop
 
