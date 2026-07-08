@@ -2,8 +2,8 @@ import asyncio
 import logging
 import json
 import os
-from datetime import datetime, timedelta
-from typing import Dict, Optional
+from datetime import datetime
+from typing import Optional
 
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -173,8 +173,10 @@ def create_application():
         logger.error("❌ Не указан BOT_TOKEN в переменных окружения!")
         return None
 
+    # Создаем приложение с автоматическим сбросом вебхуков
     application = Application.builder().token(BOT_TOKEN).build()
 
+    # Регистрируем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("report", report))
     application.add_handler(CallbackQueryHandler(button_callback))
@@ -183,13 +185,24 @@ def create_application():
 
     return application
 
+# --- Функция для очистки старых соединений ---
+async def clean_up_old_sessions(bot):
+    """Принудительно удаляем старые вебхуки и ожидающие обновления"""
+    try:
+        # Удаляем вебхук (на всякий случай)
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Вебхук удален, очищены ожидающие обновления")
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось удалить вебхук: {e}")
+
 # --- Главная асинхронная функция ---
 async def main():
     """Основная асинхронная функция запуска"""
     logger.info("🚀 Запуск бота...")
 
-    # 1. Запускаем Flask в отдельном потоке (через asyncio.to_thread)
-    flask_task = asyncio.to_thread(run_flask)
+    # 1. Запускаем Flask в отдельном потоке
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     logger.info(f"🌐 Flask сервер запущен на порту {os.environ.get('PORT', 8080)}")
 
     # 2. Создаем приложение Telegram бота
@@ -200,12 +213,24 @@ async def main():
         return
 
     logger.info("✅ Бот успешно создан")
+
+    # 3. Очищаем старые сессии перед запуском
+    await clean_up_old_sessions(application.bot)
+
+    # Небольшая пауза, чтобы Telegram успел обработать удаление вебхука
+    await asyncio.sleep(1)
+
     logger.info("🤖 Бот запущен и готов к работе!")
 
-    # 3. Запускаем бота
+    # 4. Инициализация и запуск с принудительным сбросом старых соединений
     await application.initialize()
     await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
+
+    # Важно: drop_pending_updates=True сбрасывает все ожидающие обновления
+    await application.updater.start_polling(
+        drop_pending_updates=True,
+        allowed_updates=None  # Получаем все типы обновлений
+    )
 
     # Держим бота активным
     try:
@@ -214,7 +239,18 @@ async def main():
     except (KeyboardInterrupt, SystemExit):
         logger.info("🛑 Бот остановлен")
         await application.stop()
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка: {e}")
+        await application.stop()
 
 if __name__ == "__main__":
-    # Используем asyncio.run для корректной работы event loop
-    asyncio.run(main())
+    try:
+        # Явно указываем создание нового event loop
+        if os.name == 'nt':  # Windows
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"❌ Фатальная ошибка: {e}")
