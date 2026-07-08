@@ -36,21 +36,43 @@ scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/au
 client = None
 
 def init_google_sheets():
-    """Инициализация клиента Google Sheets"""
-    global client
+    """Инициализация Google Sheets API из переменных окружения"""
     try:
-        creds_json = os.getenv("GOOGLE_CREDENTIALS")
-        if not creds_json:
-            logger.error("❌ GOOGLE_CREDENTIALS не найдены в переменных окружения!")
+        SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+        creds_dict = {
+            "type": "service_account",
+            "project_id": os.getenv("PROJECT_ID"),
+            "private_key_id": os.getenv("PRIVATE_KEY_ID"),
+            "private_key": os.getenv("PRIVATE_KEY").replace("\\n", "\n") if os.getenv("PRIVATE_KEY") else None,
+            "client_email": os.getenv("CLIENT_EMAIL"),
+            "client_id": os.getenv("CLIENT_ID"),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": os.getenv("CLIENT_X509_CERT_URL")
+        }
+
+        # Проверка обязательных полей
+        required_fields = ["private_key", "client_email", "client_id"]
+        missing = [f for f in required_fields if not creds_dict[f]]
+        if missing:
+            logger.error(f"Missing required credentials: {', '.join(missing)}")
             return None
 
-        creds_dict = json.loads(creds_json)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict, scopes=SCOPES)
         client = gspread.authorize(creds)
-        logger.info("✅ Google Sheets авторизован")
-        return client
+
+        spreadsheet_id = os.getenv("SPREADSHEET_ID")
+        if not spreadsheet_id:
+            logger.error("SPREADSHEET_ID not set")
+            return None
+
+        sheet = client.open_by_key(spreadsheet_id)
+        logger.info(f"Connected to spreadsheet: {sheet.title}")
+        return sheet
     except Exception as e:
-        logger.error(f"❌ Ошибка авторизации Google Sheets: {e}")
+        logger.error(f"Google Sheets init error: {e}", exc_info=True)
         return None
 
 def get_spreadsheet():
@@ -399,11 +421,11 @@ async def send_reminder(bot):
         logger.error(f"Ошибка в напоминалке: {e}")
 
 # ---------------------------------------------------------
-# ЗАПУСК БОТА
+# ЗАПУСК БОТА (♻️ ИСПРАВЛЕННАЯ ВЕРСИЯ)
 # ---------------------------------------------------------
 
-def main():
-    """Главная функция запуска"""
+async def main_async():
+    """Асинхронная главная функция запуска"""
     logger.info("🚀 Запуск бота...")
 
     # Проверяем токен
@@ -441,13 +463,32 @@ def main():
         args=[application.bot],
         id="reminder_19_30"
     )
-    scheduler.start()
+    scheduler.start()  # ✅ Теперь планировщик запускается внутри event loop
     logger.info("✅ Планировщик запущен (напоминания в 14:50 и 19:30)")
 
     # Запускаем бота с очисткой старых обновлений
     logger.info("🤖 Бот запущен и готов к работе!")
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # ✅ Используем асинхронный запуск
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
+
+    # Держим бота запущенным
+    try:
+        # Ожидаем пока бот работает
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("⏹ Бот остановлен")
+        await application.shutdown()
+
+def main():
+    """Синхронная обертка для запуска асинхронного кода"""
+    asyncio.run(main_async())  # ✅ Явно создаем event loop
 
 if __name__ == "__main__":
     main()
