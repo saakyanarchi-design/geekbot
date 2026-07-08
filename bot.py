@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # НАСТРОЙКИ БОТА
 # ---------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")  # Берём из переменных окружения Render
-CHAT_ID = int(os.getenv("CHAT_ID", "-10013813207765"))  # Исправлено: убрал лишний 0
+CHAT_ID = int(os.getenv("CHAT_ID", "-1003813207765"))  # Исправлено: убрал лишний 0
 SPREADSHEET_NAME = "Отчёты/ Срезы ОТБ Июль"
 REF_SHEET_NAME = "СПРАВОЧНИКИ"
 SCHEDULE_SHEET_NAME = "График"
