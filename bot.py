@@ -10,7 +10,7 @@ from google.oauth2 import service_account
 from typing import List, Dict, Optional
 from google.oauth2 import service_account
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -490,17 +490,17 @@ async def main_async():
         logger.info("⏹ Бот остановлен")
         await application.shutdown()
 
-def main():
-    """Синхронная обертка для запуска асинхронного кода"""
-    # Добавляем этот блок для Render, чтобы он видел порт
     def run_dummy_server():
-        server = HTTPServer(('0.0.0.0', int(os.getenv("PORT", 10000))), BaseHTTPRequestHandler)
+        class HealthCheckHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args): return # Отключает лишний спам в логах
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+
+        server = HTTPServer(('0.0.0.0', int(os.getenv("PORT", 10000))), HealthCheckHandler)
         server.serve_forever()
 
-    threading.Thread(target=run_dummy_server, daemon=True).start()
-    # -------------------
-
-    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
