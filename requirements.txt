@@ -1,6 +1,7 @@
-   python-telegram-bot==21.10
-   Flask==3.1.1
-   gunicorn==23.0.0
+   python-telegram-bot
+   Flask
    gspread
    oauth2client
    google-api-python-client
+   pytz
+   aiohttp
