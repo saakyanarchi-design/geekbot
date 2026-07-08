@@ -1,11 +1,11 @@
 import os
-import logging
 import asyncio
+import logging
 from datetime import datetime, timedelta
 import pytz
 import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -25,10 +25,13 @@ MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHAT_ID = int(os.getenv('CHAT_ID')) if os.getenv('CHAT_ID') else None
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
-RANGE_NAME = os.getenv('RANGE_NAME', 'A:Z')
 PORT = int(os.getenv('PORT', 8080))
 
-# --- Собираем словарь для Google Credentials ---
+# Названия листов (точь-в-точь как у вас)
+REF_SHEET_NAME = "СПРАВОЧНИКИ"
+SCHEDULE_SHEET_NAME = "График"
+
+# --- Собираем словарь для Google Credentials из ENV ---
 creds_dict = {
     "type": os.getenv("TYPE"),
     "project_id": os.getenv("PROJECT_ID"),
@@ -44,11 +47,9 @@ creds_dict = {
 
 # ========================= ВЕБ-СЕРВЕР ДЛЯ RENDER =========================
 async def handle_health(request):
-    """Обработчик для проверки здоровья сервиса Render."""
     return web.Response(text="GeekBot is running!")
 
 async def start_web_server():
-    """Запускает минимальный веб-сервер для Health Check Render."""
     app = web.Application()
     app.router.add_get('/', handle_health)
     runner = web.AppRunner(app)
@@ -57,85 +58,216 @@ async def start_web_server():
     await site.start()
     logger.info(f"Веб-сервер запущен на порту {PORT}")
 
-# ========================= ФУНКЦИЯ ДЛЯ ТАБЛИЦЫ =========================
-def get_sheet_data():
-    """Возвращает все значения из таблицы Google Sheets."""
+# ========================= РАБОТА С GOOGLE SHEETS =========================
+def get_google_service():
+    """Создает сервис Google Sheets."""
     try:
         creds = Credentials.from_service_account_info(creds_dict)
         service = build('sheets', 'v4', credentials=creds)
-        sheet = service.spreadsheets()
-        result = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME).execute()
-        values = result.get('values', [])
-        return values
+        return service
     except Exception as e:
-        logger.error(f"Ошибка при получении данных из таблицы: {e}")
+        logger.error(f"Ошибка авторизации Google: {e}")
         return None
 
-# ========================= ФУНКЦИЯ ОТПРАВКИ =========================
-async def send_message(text: str, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет сообщение в заданный чат."""
+def get_sheet_data(sheet_name, range_name='A:Z'):
+    """Получает данные с конкретного листа."""
+    service = get_google_service()
+    if not service:
+        return None
     try:
-        await context.bot.send_message(chat_id=CHAT_ID, text=text)
-        logger.info(f"Сообщение отправлено в чат {CHAT_ID}")
+        # Важно: указываем ИД таблицы и диапазон с именем листа
+        full_range = f"'{sheet_name}'!{range_name}"
+        sheet = service.spreadsheets()
+        result = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=full_range).execute()
+        return result.get('values', [])
     except Exception as e:
-        logger.error(f"Ошибка отправки сообщения: {e}")
+        logger.error(f"Ошибка чтения листа {sheet_name}: {e}")
+        return None
 
-# ========================= КОМАНДЫ =========================
+# ========================= ГЛАВНАЯ МАГИЯ: СПИСОК АКТИВНЫХ МЕНЕДЖЕРОВ =========================
+def get_active_managers_for_today():
+    """
+    Основная логика:
+    1. Берем СПРАВОЧНИКИ: ищем строки, где есть полное имя (столбец A) И никнейм (столбец B).
+       Если никнейма нет — человек уволен/неактивен, игнорируем.
+    2. Берем График: ищем колонку с сегодняшним ЧИСЛОМ.
+    3. Возвращаем только тех, у кого стоит отметка 'TRUE' (или аналог) и есть никнейм.
+    """
+    try:
+        # 1. Читаем справочник
+        ref_data = get_sheet_data(REF_SHEET_NAME)
+        if not ref_data or len(ref_data) < 2:
+            logger.warning("Нет данных в справочнике")
+            return []
+
+        candidates = []
+        # Пропускаем заголовок (индекс 0)
+        for row in ref_data[1:]:
+            # Проверяем, что есть и Имя (A) и Никнейм (B)
+            if len(row) >= 2 and row[0].strip() and row[1].strip():
+                candidates.append({
+                    "full_name": row[0].strip(),
+                    "username": row[1].strip().replace("@", "") # Убираем @ если есть
+                })
+
+        if not candidates:
+            logger.info("Нет кандидатов с заполненными никнеймами")
+            return []
+
+        # 2. Читаем график
+        schedule_data = get_sheet_data(SCHEDULE_SHEET_NAME)
+        if not schedule_data:
+            return []
+
+        # Ищем колонку с сегодняшним числом
+        today_str = datetime.now(MOSCOW_TZ).strftime("%d")
+        header_row = schedule_data[0]
+        target_col_index = -1
+
+        for idx, val in enumerate(header_row):
+            clean_val = str(val).strip()
+            if clean_val == today_str or clean_val == str(int(today_str)):
+                target_col_index = idx
+                break
+
+        if target_col_index == -1:
+            logger.warning(f"Не найдена колонка с датой {today_str} в графике.")
+            return []
+
+        # 3. Строим карту: Имя -> Статус (TRUE/FALSE)
+        schedule_map = {}
+        for row in schedule_data[1:]:
+            if len(row) > target_col_index and row[0].strip():
+                name = row[0].strip()
+                status_cell = row[target_col_index] if target_col_index < len(row) else ""
+                is_working = str(status_cell).strip().lower() in ["true", "1", "да", "✓", "+"]
+                schedule_map[name] = is_working
+
+        # 4. Финальный фильтр
+        active_managers = []
+        for cand in candidates:
+            if schedule_map.get(cand["full_name"], False):
+                active_managers.append(cand)
+
+        logger.info(f"Найдено активных менеджеров с никнеймами: {len(active_managers)}")
+        return active_managers
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка в get_active_managers: {e}")
+        return []
+
+# ========================= КОМАНДЫ БОТА =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я GeekBot. Бот запущен и работает!")
+    """Стартовое сообщение с кнопкой."""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Сдать отчёт", callback_data="submit_report")]
+    ])
+    await update.message.reply_text(
+        "Привет! Я бот для контроля отчётов.\nНажмите кнопку ниже, чтобы сдать отчёт.",
+        reply_markup=keyboard
+    )
 
-async def get_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет данные из таблицы по запросу /get_data."""
-    data = get_sheet_data()
-    if data:
-        lines = []
-        for row in data[:5]:  # Показываем первые 5 строк
-            lines.append(" | ".join(row))
-        msg = "Данные из таблицы (первые 5 строк):\n" + "\n".join(lines)
-        await update.message.reply_text(msg)
-    else:
-        await update.message.reply_text("Не удалось получить данные из таблицы.")
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /report — дублируем кнопку."""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Сдать отчёт", callback_data="submit_report")]
+    ])
+    await update.message.reply_text("Ваш отчёт:", reply_markup=keyboard)
 
-# ========================= ПЛАНИРОВЩИК =========================
-async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
-    """Проверка напоминаний (заглушка)."""
-    data = get_sheet_data()
-    if data:
-        # Здесь можно добавить логику напоминаний
-        pass
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатия на кнопку."""
+    query = update.callback_query
+    await query.answer()  # Убираем "часики"
+
+    if query.data == "submit_report":
+        user = query.from_user
+        username = user.username
+
+        if not username:
+            await query.message.reply_text("⚠️ У вас не установлен username в Telegram. Свяжитесь с администратором.")
+            return
+
+        # 1. Получаем полное имя из справочника
+        ref_data = get_sheet_data(REF_SHEET_NAME)
+        full_name = None
+        if ref_data:
+            for row in ref_data[1:]:
+                if len(row) >= 2 and row[1].strip().replace("@", "").lower() == username.lower():
+                    full_name = row[0].strip()
+                    break
+
+        if not full_name:
+            await query.message.reply_text(f"❌ @{username} не найден в справочнике или уволен.")
+            return
+
+        # 2. Проверяем график
+        active_managers = get_active_managers_for_today()
+        is_on_shift = any(m["full_name"] == full_name for m in active_managers)
+
+        if not is_on_shift:
+            await query.message.reply_text("⛔ Вы сегодня не на смене по графику!")
+            return
+
+        # 3. Отправка отчёта в группу
+        now = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M')
+        await context.bot.send_message(
+            CHAT_ID,
+            f"📋 Отчёт сдан!\n👤 Менеджер: {full_name} (@{username})\n🕒 Время: {now}"
+        )
+        await query.message.reply_text("✅ Отчёт успешно отправлен в группу!")
+        logger.info(f"Отчёт от {full_name} (@{username}) отправлен.")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка, кто сегодня на смене."""
+    managers = get_active_managers_for_today()
+    if not managers:
+        await update.message.reply_text("Сегодня на смене никого нет.")
+        return
+    names = "\n".join([f"• {m['full_name']} (@{m['username']})" for m in managers])
+    await update.message.reply_text(f"👥 Сейчас на смене:\n{names}")
+
+# ========================= ПЛАНИРОВЩИК (НАПОМИНАЛКА) =========================
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача: утром напоминает, кто на смене."""
+    try:
+        managers = get_active_managers_for_today()
+        if not managers:
+            return
+        names = "\n".join([f"• {m['full_name']} (@{m['username']})" for m in managers])
+        msg = f"⏰ Доброе утро! Сегодня на смене:\n{names}\nНе забудьте сдать отчёты: /report"
+        await context.bot.send_message(CHAT_ID, msg)
+        logger.info("Утренняя напоминалка отправлена.")
+    except Exception as e:
+        logger.error(f"Ошибка в напоминалке: {e}")
 
 # ========================= ГЛАВНАЯ ФУНКЦИЯ =========================
 async def main():
-    """Основная асинхронная функция запуска бота."""
-    try:
-        # Сначала запускаем веб-сервер для Health Check Render
-        await start_web_server()
+    # 1. Запускаем заглушку для Render
+    await start_web_server()
 
-        # Создаем приложение Telegram бота
-        app = Application.builder().token(BOT_TOKEN).build()
+    # 2. Создаем приложение
+    app = Application.builder().token(BOT_TOKEN).build()
 
-        # Регистрируем команды
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("get_data", get_data))
+    # 3. Регистрируем хендлеры
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("report", report_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CallbackQueryHandler(button_handler, pattern="^submit_report$"))
 
-        # Запускаем планировщик
-        scheduler = AsyncIOScheduler(timezone=str(MOSCOW_TZ))
-        scheduler.add_job(check_reminders, 'interval', minutes=5, args=[app])
-        scheduler.start()
+    # 4. Планировщик
+    scheduler = AsyncIOScheduler(timezone=str(MOSCOW_TZ))
+    # Будем слать напоминалку в 09:00 утра
+    scheduler.add_job(send_reminder, 'cron', hour=9, minute=0, args=[app])
+    scheduler.start()
+    logger.info("Планировщик запущен.")
 
-        logger.info("Бот запущен и готов к работе!")
+    # 5. Поллинг
+    logger.info("Бот запущен и готов к работе!")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
 
-        # Запускаем бота через polling
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
+    await asyncio.Event().wait()
 
-        # Держим бота запущенным
-        await asyncio.Event().wait()
-
-    except Exception as e:
-        logger.error(f"Критическая ошибка при запуске бота: {e}")
-        raise
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
