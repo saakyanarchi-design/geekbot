@@ -1,256 +1,316 @@
 import asyncio
+import datetime
 import logging
-import json
 import os
-from datetime import datetime
-from typing import Optional
+from typing import List, Dict, Optional
 
-import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-import pytz
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
-# --- Flask для Render ---
-from flask import Flask
-from threading import Thread
-
-# --- Настройка логирования ---
+# ---------------------------------------------------------
+# НАСТРОЙКИ ЛОГИРОВАНИЯ
+# ---------------------------------------------------------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- Конфигурация ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS")
-SPREADSHEET_ID = "1VEr06vI-UqFxhby6lUx5b9-KxOH4FX-EZ8SvrZ6Fks0"
+# ---------------------------------------------------------
+# НАСТРОЙКИ БОТА
+# ---------------------------------------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # Берём из переменных окружения Render
+CHAT_ID = int(os.getenv("CHAT_ID", "-10013813207765"))  # Исправлено: убрал лишний 0
+SPREADSHEET_NAME = "Отчёты/ Срезы ОТБ Июль"
+REF_SHEET_NAME = "СПРАВОЧНИКИ"
+SCHEDULE_SHEET_NAME = "График"
 
-# --- Flask приложение для Render ---
-app_flask = Flask(__name__)
+# ---------------------------------------------------------
+# ПОДГОТОВКА GOOGLE SHEETS
+# ---------------------------------------------------------
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+client = None
 
-@app_flask.route('/')
-def home():
-    return "Bot is running!"
-
-@app_flask.route('/health')
-def health():
-    return "OK", 200
-
-def run_flask():
-    """Запускаем Flask сервер"""
-    port = int(os.environ.get("PORT", 8080))
-    app_flask.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-
-# --- Инициализация Google Sheets ---
 def init_google_sheets():
     """Инициализация клиента Google Sheets"""
+    global client
     try:
-        if not GOOGLE_CREDENTIALS_JSON:
-            logger.error("❌ Не найдены GOOGLE_CREDENTIALS в переменных окружения!")
+        # В Render credentials хранятся в переменной окружения
+        creds_json = os.getenv("GOOGLE_CREDENTIALS")
+        if not creds_json:
+            logger.error("❌ GOOGLE_CREDENTIALS не найдены в переменных окружения!")
             return None
 
-        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
-        service = build('sheets', 'v4', credentials=creds)
-        sheet = service.spreadsheets()
-        logger.info("✅ Успешное подключение к Google Sheets")
-        return sheet
+        import json
+        creds_dict = json.loads(creds_json)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        logger.info("✅ Google Sheets авторизован")
+        return client
     except Exception as e:
-        logger.error(f"❌ Ошибка подключения к Google Sheets: {e}")
+        logger.error(f"❌ Ошибка авторизации Google Sheets: {e}")
         return None
 
-# --- Получение данных из таблицы ---
-def get_sheet_data():
-    """Получение данных из Google таблицы"""
+def get_spreadsheet():
+    """Получение таблицы по имени"""
+    if not client:
+        init_google_sheets()
+    if not client:
+        return None
     try:
-        sheet = init_google_sheets()
-        if not sheet:
-            return None
-
-        result = sheet.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="'Срез данных по состоянию на 06.07.2026'!A:Z"
-        ).execute()
-
-        values = result.get('values', [])
-
-        if not values:
-            logger.warning("⚠️ Таблица пуста или данные не найдены")
-            return None
-
-        logger.info(f"✅ Получено {len(values)} строк данных")
-        return values
-
+        return client.open(SPREADSHEET_NAME)
+    except gspread.exceptions.SpreadsheetNotFound:
+        logger.error(f"❌ Не найдена таблица: {SPREADSHEET_NAME}")
+        return None
     except Exception as e:
-        logger.error(f"❌ Ошибка получения данных из таблицы: {e}")
+        logger.error(f"❌ Ошибка открытия таблицы: {e}")
         return None
 
-# --- Обработчики команд ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
-    user = update.effective_user
-    welcome_message = (
-        f"👋 Привет, {user.first_name}!\n\n"
-        f"🤖 Я бот для работы с отчётами ОТБ.\n\n"
-        f"📋 Доступные команды:\n"
-        f"• /report - получить текущий отчёт\n"
-        f"• /start - показать это сообщение\n\n"
-        f"💡 Просто отправьте /report, чтобы получить актуальные данные!"
+def get_active_managers_for_today() -> List[Dict[str, str]]:
+    """Получение списка активных менеджеров на сегодня"""
+    try:
+        spreadsheet = get_spreadsheet()
+        if not spreadsheet:
+            return []
+
+        # Читаем справочник
+        ref_sheet = spreadsheet.worksheet(REF_SHEET_NAME)
+        ref_data = ref_sheet.get_all_values()
+
+        candidates = []
+        for row in ref_data[1:]:  # Пропускаем заголовок
+            if len(row) >= 2 and row[0] and row[1]:
+                candidates.append({
+                    "full_name": row[0].strip(),
+                    "username": row[1].strip()
+                })
+
+        if not candidates:
+            logger.warning("Не найдено активных менеджеров в справочнике.")
+            return []
+
+        # Читаем график
+        schedule_sheet = spreadsheet.worksheet(SCHEDULE_SHEET_NAME)
+        schedule_data = schedule_sheet.get_all_values()
+        if not schedule_data:
+            logger.warning("Лист 'График' пуст")
+            return []
+
+        today_str = datetime.datetime.now().strftime("%d")
+        header_row = schedule_data[0]
+        target_col_index = -1
+
+        for idx, val in enumerate(header_row):
+            clean_val = str(val).strip()
+            if clean_val == today_str or clean_val == str(int(today_str)):
+                target_col_index = idx
+                break
+
+        if target_col_index == -1:
+            logger.warning(f"Не найдена колонка с датой {today_str}")
+            return []
+
+        # Строим карту статусов
+        schedule_map = {}
+        for row in schedule_data[1:]:
+            if len(row) > target_col_index:
+                name = row[0].strip() if row[0] else ""
+                status_cell = row[target_col_index] if target_col_index < len(row) else ""
+                is_working = str(status_cell).strip().lower() in ["true", "1", "да", "✓"]
+                schedule_map[name] = is_working
+
+        # Фильтруем кандидатов
+        active_managers = []
+        for cand in candidates:
+            if schedule_map.get(cand["full_name"], False):
+                active_managers.append(cand)
+
+        return active_managers
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении списка менеджеров: {e}")
+        return []
+
+# ---------------------------------------------------------
+# ОБРАБОТЧИКИ КОМАНД
+# ---------------------------------------------------------
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик /start"""
+    await update.message.reply_text(
+        "👋 Привет! Я бот для контроля отчётов ОТБ.\n"
+        "Нажмите кнопку ниже, чтобы сдать отчёт."
     )
-    await update.message.reply_text(welcome_message)
 
-async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /report"""
-    await update.message.reply_text("📊 Загружаю данные из Google Sheets...")
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик /report"""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Сдать отчёт", callback_data="submit_report")]
+    ])
+    await update.message.reply_text("📊 Выберите действие:", reply_markup=kb)
 
-    try:
-        data = get_sheet_data()
-
-        if not data:
-            await update.message.reply_text(
-                "❌ Не удалось получить данные из таблицы.\n"
-                "Проверьте подключение к Google Sheets."
-            )
-            return
-
-        report_text = (
-            f"📊 Отчёт ОТБ\n"
-            f"📅 Дата: {datetime.now(pytz.timezone('Europe/Moscow')).strftime('%d.%m.%Y %H:%M')}\n\n"
-            f"✅ Данные получены\n"
-            f"📈 Всего записей: {len(data) - 1} (без заголовка)\n\n"
-            f"⚙️ Расширенный функционал в разработке..."
-        )
-
-        await update.message.reply_text(report_text)
-
-    except Exception as e:
-        logger.error(f"❌ Ошибка в команде /report: {e}")
-        await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатий на кнопки"""
+async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки 'Сдать отчёт'"""
     query = update.callback_query
     await query.answer()
 
-    if query.data == "refresh":
-        await query.edit_message_text("🔄 Обновляю данные...")
-        data = get_sheet_data()
-        if data:
-            await query.edit_message_text(
-                f"✅ Данные обновлены!\n"
-                f"📊 Всего записей: {len(data) - 1}"
-            )
-        else:
-            await query.edit_message_text("❌ Не удалось обновить данные")
+    user = query.from_user
+    username = user.username
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик обычных сообщений"""
-    await update.message.reply_text(
-        "🤖 Я вас не понял.\n"
-        "Используйте команды:\n"
-        "• /start - приветствие\n"
-        "• /report - получить отчёт"
-    )
+    if not username:
+        await query.answer("❌ У вас нет username в Telegram!", show_alert=True)
+        return
+
+    spreadsheet = get_spreadsheet()
+    if not spreadsheet:
+        await query.answer("❌ Ошибка подключения к таблице!", show_alert=True)
+        return
+
+    try:
+        ref_sheet = spreadsheet.worksheet(REF_SHEET_NAME)
+        ref_data = ref_sheet.get_all_values()
+
+        full_name = None
+        for row in ref_data[1:]:
+            if len(row) >= 2 and row[1].strip().lower() == username.lower():
+                full_name = row[0].strip()
+                break
+
+        if not full_name:
+            await query.answer(
+                f"❌ Вы (@{username}) не найдены в списке менеджеров!", 
+                show_alert=True
+            )
+            return
+
+        # Проверка графика
+        active_managers = get_active_managers_for_today()
+        is_on_shift = any(m["full_name"] == full_name for m in active_managers)
+
+        if not is_on_shift:
+            await query.answer(
+                "❌ Вы сейчас не на смене по графику!", 
+                show_alert=True
+            )
+            return
+
+        # Отправка отчёта в группу
+        current_time = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"📋 <b>Отчёт сдан!</b>\n\n"
+                 f"👤 Менеджер: {full_name} (@{username})\n"
+                 f"📅 Дата: {current_time}",
+            parse_mode='HTML'
+        )
+
+        # Подтверждение в личку
+        await query.edit_message_text(
+            f"✅ <b>Отчёт успешно отправлен!</b>\n\n"
+            f"📅 {current_time}",
+            parse_mode='HTML'
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка при отправке отчёта: {e}")
+        await query.answer("❌ Произошла ошибка!", show_alert=True)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик ошибок"""
-    logger.error(f"❌ Ошибка: {context.error}")
+    logger.error(f"Ошибка: {context.error}")
     if update and update.effective_message:
         await update.effective_message.reply_text(
-            "❌ Произошла ошибка. Пожалуйста, попробуйте позже."
+            "❌ Произошла ошибка. Попробуйте позже."
         )
 
-# --- Создание приложения бота ---
-def create_application():
-    """Создание и настройка приложения бота"""
-    if not BOT_TOKEN:
-        logger.error("❌ Не указан BOT_TOKEN в переменных окружения!")
-        return None
+# ---------------------------------------------------------
+# ПЛАНИРОВЩИК
+# ---------------------------------------------------------
 
-    # Создаем приложение с автоматическим сбросом вебхуков
+async def send_reminder(bot: Application.bot):
+    """Отправка напоминания в группу"""
+    try:
+        managers = get_active_managers_for_today()
+        if not managers:
+            logger.info("Сегодня нет активных менеджеров")
+            return
+
+        names = "\n".join([f"• {m['full_name']} (@{m['username']})" for m in managers])
+        msg = f"⏰ <b>Напоминание!</b>\n\nСегодня на смене:\n{names}\n\nПора сдать отчёт! 📋"
+
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=msg,
+            parse_mode='HTML'
+        )
+        logger.info(f"Напоминание отправлено. Менеджеров: {len(managers)}")
+
+    except Exception as e:
+        logger.error(f"Ошибка в напоминалке: {e}")
+
+# ---------------------------------------------------------
+# ЗАПУСК БОТА
+# ---------------------------------------------------------
+
+async def main():
+    """Главная функция запуска"""
+    logger.info("🚀 Запуск бота...")
+
+    # Проверяем токен
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN не найден в переменных окружения!")
+        return
+
+    # Инициализируем Google Sheets
+    init_google_sheets()
+
+    # Создаём приложение
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Регистрируем обработчики
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("report", report))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("report", cmd_report))
+    application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="submit_report"))
     application.add_error_handler(error_handler)
 
-    return application
+    # Настраиваем планировщик
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        send_reminder,
+        'cron',
+        hour=9,
+        minute=0,
+        args=[application.bot]
+    )
+    scheduler.start()
+    logger.info("✅ Планировщик запущен (напоминание в 9:00)")
 
-# --- Функция для очистки старых соединений ---
-async def clean_up_old_sessions(bot):
-    """Принудительно удаляем старые вебхуки и ожидающие обновления"""
-    try:
-        # Удаляем вебхук (на всякий случай)
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✅ Вебхук удален, очищены ожидающие обновления")
-    except Exception as e:
-        logger.warning(f"⚠️ Не удалось удалить вебхук: {e}")
-
-# --- Главная асинхронная функция ---
-async def main():
-    """Основная асинхронная функция запуска"""
-    logger.info("🚀 Запуск бота...")
-
-    # 1. Запускаем Flask в отдельном потоке
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info(f"🌐 Flask сервер запущен на порту {os.environ.get('PORT', 8080)}")
-
-    # 2. Создаем приложение Telegram бота
-    application = create_application()
-
-    if not application:
-        logger.error("❌ Не удалось создать приложение бота")
-        return
-
-    logger.info("✅ Бот успешно создан")
-
-    # 3. Очищаем старые сессии перед запуском
-    await clean_up_old_sessions(application.bot)
-
-    # Небольшая пауза, чтобы Telegram успел обработать удаление вебхука
-    await asyncio.sleep(1)
-
+    # Запускаем бота с очисткой старых обновлений
     logger.info("🤖 Бот запущен и готов к работе!")
 
-    # 4. Инициализация и запуск с принудительным сбросом старых соединений
+    # Важно: удаляем вебхук и сбрасываем старые обновления
+    await application.bot.delete_webhook(drop_pending_updates=True)
+
+    # Запускаем polling
     await application.initialize()
     await application.start()
-
-    # Важно: drop_pending_updates=True сбрасывает все ожидающие обновления
-    await application.updater.start_polling(
-        drop_pending_updates=True,
-        allowed_updates=None  # Получаем все типы обновлений
-    )
+    await application.updater.start_polling(drop_pending_updates=True)
 
     # Держим бота активным
     try:
-        # Бесконечное ожидание (бот работает, пока не остановят)
         await asyncio.Event().wait()
-    except (KeyboardInterrupt, SystemExit):
+    except KeyboardInterrupt:
         logger.info("🛑 Бот остановлен")
-        await application.stop()
-    except Exception as e:
-        logger.error(f"❌ Критическая ошибка: {e}")
+        scheduler.shutdown()
         await application.stop()
 
 if __name__ == "__main__":
     try:
-        # Явно указываем создание нового event loop
-        if os.name == 'nt':  # Windows
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("🛑 Бот остановлен пользователем")
+        logger.info("Бот остановлен пользователем.")
     except Exception as e:
-        logger.error(f"❌ Фатальная ошибка: {e}")
+        logger.error(f"Критическая ошибка: {e}")
