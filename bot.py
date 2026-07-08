@@ -1,15 +1,10 @@
-import os
-import asyncio
 import logging
-from datetime import datetime, timedelta
-import pytz
-import requests
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from aiohttp import web
+import os
+from datetime import datetime
+import gspread
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from oauth2client.service_account import ServiceAccountCredentials
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -18,256 +13,221 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Определяем временную зону ---
-MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+# --- Настройки ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+GOOGLE_SHEETS_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
+SHEET_NAME = "Отчёты/ Срезы ОТБ Июль"
 
-# --- Загружаем переменные окружения ---
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-CHAT_ID = int(os.getenv('CHAT_ID')) if os.getenv('CHAT_ID') else None
-SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
-PORT = int(os.getenv('PORT', 8080))
-
-# Названия листов (точь-в-точь как у вас)
-REF_SHEET_NAME = "СПРАВОЧНИКИ"
-SCHEDULE_SHEET_NAME = "График"
-
-# --- Собираем словарь для Google Credentials из ENV ---
-creds_dict = {
-    "type": os.getenv("TYPE"),
-    "project_id": os.getenv("PROJECT_ID"),
-    "private_key_id": os.getenv("PRIVATE_KEY_ID"),
-    "private_key": os.getenv("PRIVATE_KEY").replace("\\n", "\n"),
-    "client_email": os.getenv("CLIENT_EMAIL"),
-    "client_id": os.getenv("CLIENT_ID"),
-    "auth_uri": os.getenv("AUTH_URI"),
-    "token_uri": os.getenv("TOKEN_URI"),
-    "auth_provider_x509_cert_url": os.getenv("AUTH_PROVIDER_CERT_URL"),
-    "client_x509_cert_url": os.getenv("CLIENT_CERT_URL"),
-}
-
-# ========================= ВЕБ-СЕРВЕР ДЛЯ RENDER =========================
-async def handle_health(request):
-    return web.Response(text="GeekBot is running!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle_health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    logger.info(f"Веб-сервер запущен на порту {PORT}")
-
-# ========================= РАБОТА С GOOGLE SHEETS =========================
-def get_google_service():
-    """Создает сервис Google Sheets."""
+# --- Подключение к Google Sheets ---
+def get_google_sheet():
     try:
-        creds = Credentials.from_service_account_info(creds_dict)
-        service = build('sheets', 'v4', credentials=creds)
-        return service
+        # Если credentials переданы как строка JSON из переменной окружения
+        import json
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        sheet = client.open(SHEET_NAME)
+        logger.info("✅ Успешное подключение к Google Sheets")
+        return sheet
     except Exception as e:
-        logger.error(f"Ошибка авторизации Google: {e}")
+        logger.error(f"❌ Ошибка подключения к Google Sheets: {e}")
         return None
 
-def get_sheet_data(sheet_name, range_name='A:Z'):
-    """Получает данные с конкретного листа."""
-    service = get_google_service()
-    if not service:
-        return None
+# --- Проверка, может ли пользователь сдать отчёт ---
+def check_can_submit_report(username):
     try:
-        # Важно: указываем ИД таблицы и диапазон с именем листа
-        full_range = f"'{sheet_name}'!{range_name}"
-        sheet = service.spreadsheets()
-        result = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range=full_range).execute()
-        return result.get('values', [])
-    except Exception as e:
-        logger.error(f"Ошибка чтения листа {sheet_name}: {e}")
-        return None
+        # 1. Получаем имя сотрудника из листа "СПРАВОЧНИКИ"
+        sheet = get_google_sheet()
+        if not sheet:
+            return False, "❌ Ошибка подключения к базе данных."
 
-# ========================= ГЛАВНАЯ МАГИЯ: СПИСОК АКТИВНЫХ МЕНЕДЖЕРОВ =========================
-def get_active_managers_for_today():
-    """
-    Основная логика:
-    1. Берем СПРАВОЧНИКИ: ищем строки, где есть полное имя (столбец A) И никнейм (столбец B).
-       Если никнейма нет — человек уволен/неактивен, игнорируем.
-    2. Берем График: ищем колонку с сегодняшним ЧИСЛОМ.
-    3. Возвращаем только тех, у кого стоит отметка 'TRUE' (или аналог) и есть никнейм.
-    """
-    try:
-        # 1. Читаем справочник
-        ref_data = get_sheet_data(REF_SHEET_NAME)
-        if not ref_data or len(ref_data) < 2:
-            logger.warning("Нет данных в справочнике")
-            return []
+        sheet_refs = sheet.worksheet("СПРАВОЧНИКИ")
+        all_refs = sheet_refs.get_all_values()
 
-        candidates = []
-        # Пропускаем заголовок (индекс 0)
-        for row in ref_data[1:]:
-            # Проверяем, что есть и Имя (A) и Никнейм (B)
-            if len(row) >= 2 and row[0].strip() and row[1].strip():
-                candidates.append({
-                    "full_name": row[0].strip(),
-                    "username": row[1].strip().replace("@", "") # Убираем @ если есть
-                })
+        # Пропускаем заголовок (первая строка), если он есть
+        start_row = 1 if all_refs and all_refs[0][0] in ["Имя", "Сотрудник", ""] else 0
 
-        if not candidates:
-            logger.info("Нет кандидатов с заполненными никнеймами")
-            return []
-
-        # 2. Читаем график
-        schedule_data = get_sheet_data(SCHEDULE_SHEET_NAME)
-        if not schedule_data:
-            return []
-
-        # Ищем колонку с сегодняшним числом
-        today_str = datetime.now(MOSCOW_TZ).strftime("%d")
-        header_row = schedule_data[0]
-        target_col_index = -1
-
-        for idx, val in enumerate(header_row):
-            clean_val = str(val).strip()
-            if clean_val == today_str or clean_val == str(int(today_str)):
-                target_col_index = idx
+        user_name = None
+        for row in all_refs[start_row:]:
+            if len(row) > 1 and row[1].strip() == username:  # колонка B (никнейм)
+                user_name = row[0].strip()  # колонка A (имя)
                 break
 
-        if target_col_index == -1:
-            logger.warning(f"Не найдена колонка с датой {today_str} в графике.")
-            return []
+        if not user_name:
+            return False, "❌ Вы не найдены в базе или ваш никнейм не привязан."
 
-        # 3. Строим карту: Имя -> Статус (TRUE/FALSE)
-        schedule_map = {}
-        for row in schedule_data[1:]:
-            if len(row) > target_col_index and row[0].strip():
-                name = row[0].strip()
-                status_cell = row[target_col_index] if target_col_index < len(row) else ""
-                is_working = str(status_cell).strip().lower() in ["true", "1", "да", "✓", "+"]
-                schedule_map[name] = is_working
+        logger.info(f"✅ Найден сотрудник: {user_name}")
 
-        # 4. Финальный фильтр
-        active_managers = []
-        for cand in candidates:
-            if schedule_map.get(cand["full_name"], False):
-                active_managers.append(cand)
+        # 2. Проверяем график на сегодня
+        sheet_graph = sheet.worksheet("График")
+        data = sheet_graph.get_all_values()
 
-        logger.info(f"Найдено активных менеджеров с никнеймами: {len(active_managers)}")
-        return active_managers
+        if not data or len(data) < 2:
+            return False, "❌ Ошибка: лист 'График' пуст или содержит недостаточно данных."
+
+        # Заголовки (первая строка) - дни месяца
+        headers = data[0]
+        today_day = str(datetime.now().day)  # сегодня 8-е число
+
+        # Ищем колонку с сегодняшним числом
+        col_index = -1
+        for i, h in enumerate(headers):
+            if h and h.strip() == today_day:
+                col_index = i
+                break
+
+        if col_index == -1:
+            return False, f"❌ Ошибка: в таблице не найдена колонка с датой '{today_day}'."
+
+        # Ищем строку с именем сотрудника
+        row_index = -1
+        for i, row in enumerate(data):
+            if row and row[0].strip() == user_name:
+                row_index = i
+                break
+
+        if row_index == -1:
+            return False, f"❌ Вы ({user_name}) не найдены в списке на листе 'График'."
+
+        # 3. Проверяем значение ячейки (чекбокс)
+        cell_value = data[row_index][col_index].strip() if col_index < len(data[row_index]) else "FALSE"
+
+        # Чекбокс может быть "TRUE", "True", True или просто "1"
+        if cell_value in ["TRUE", "True", "true", "1", True]:
+            return True, f"✅ Вы на смене, {user_name}! Нажмите кнопку ниже, чтобы начать отчёт."
+        else:
+            return False, f"⛔ Сегодня у вас нет смены по графику (галочка не отмечена)."
 
     except Exception as e:
-        logger.error(f"Критическая ошибка в get_active_managers: {e}")
-        return []
+        logger.error(f"❌ Ошибка проверки: {e}")
+        return False, f"❌ Произошла ошибка при проверке графика: {str(e)}"
 
-# ========================= КОМАНДЫ БОТА =========================
+# --- Команда /start ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Стартовое сообщение с кнопкой."""
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Сдать отчёт", callback_data="submit_report")]
-    ])
+    user = update.effective_user
+    username = user.username
+
+    logger.info(f"Пользователь @{username} запустил /start")
+
+    if not username:
+        await update.message.reply_text(
+            "❌ У вас не установлен username в Telegram.\n"
+            "Пожалуйста, установите его в настройках Telegram и попробуйте снова."
+        )
+        return
+
+    # Клавиатура с главными кнопками
+    keyboard = [
+        [KeyboardButton("✅ Сдать отчёт")],
+        [KeyboardButton("❓ Помощь")]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
     await update.message.reply_text(
-        "Привет! Я бот для контроля отчётов.\nНажмите кнопку ниже, чтобы сдать отчёт.",
-        reply_markup=keyboard
+        f"👋 Привет, {user.first_name}!\n"
+        f"Я бот для сдачи отчётов.\n\n"
+        f"Нажмите «✅ Сдать отчёт», чтобы начать.",
+        reply_markup=reply_markup
     )
 
-async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /report — дублируем кнопку."""
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Сдать отчёт", callback_data="submit_report")]
-    ])
-    await update.message.reply_text("Ваш отчёт:", reply_markup=keyboard)
+# --- Команда /report ---
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.effective_user.username
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатия на кнопку."""
-    query = update.callback_query
-    await query.answer()  # Убираем "часики"
-
-    if query.data == "submit_report":
-        user = query.from_user
-        username = user.username
-
-        if not username:
-            await query.message.reply_text("⚠️ У вас не установлен username в Telegram. Свяжитесь с администратором.")
-            return
-
-        # 1. Получаем полное имя из справочника
-        ref_data = get_sheet_data(REF_SHEET_NAME)
-        full_name = None
-        if ref_data:
-            for row in ref_data[1:]:
-                if len(row) >= 2 and row[1].strip().replace("@", "").lower() == username.lower():
-                    full_name = row[0].strip()
-                    break
-
-        if not full_name:
-            await query.message.reply_text(f"❌ @{username} не найден в справочнике или уволен.")
-            return
-
-        # 2. Проверяем график
-        active_managers = get_active_managers_for_today()
-        is_on_shift = any(m["full_name"] == full_name for m in active_managers)
-
-        if not is_on_shift:
-            await query.message.reply_text("⛔ Вы сегодня не на смене по графику!")
-            return
-
-        # 3. Отправка отчёта в группу
-        now = datetime.now(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M')
-        await context.bot.send_message(
-            CHAT_ID,
-            f"📋 Отчёт сдан!\n👤 Менеджер: {full_name} (@{username})\n🕒 Время: {now}"
-        )
-        await query.message.reply_text("✅ Отчёт успешно отправлен в группу!")
-        logger.info(f"Отчёт от {full_name} (@{username}) отправлен.")
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверка, кто сегодня на смене."""
-    managers = get_active_managers_for_today()
-    if not managers:
-        await update.message.reply_text("Сегодня на смене никого нет.")
+    if not username:
+        await update.message.reply_text("❌ У вас не установлен username в Telegram.")
         return
-    names = "\n".join([f"• {m['full_name']} (@{m['username']})" for m in managers])
-    await update.message.reply_text(f"👥 Сейчас на смене:\n{names}")
 
-# ========================= ПЛАНИРОВЩИК (НАПОМИНАЛКА) =========================
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Фоновая задача: утром напоминает, кто на смене."""
-    try:
-        managers = get_active_managers_for_today()
-        if not managers:
+    can_report, message = check_can_submit_report(username)
+
+    if can_report:
+        # Создаем инлайн-клавиатуру для подтверждения
+        keyboard = [
+            [InlineKeyboardButton("✅ Да, я на смене", callback_data='confirm_report')],
+            [InlineKeyboardButton("❌ Отмена", callback_data='cancel_report')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            message,
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(message)
+
+# --- Обработка нажатий на инлайн-кнопки ---
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == 'confirm_report':
+        await query.edit_message_text(text="📝 Отлично! Начинаем сдачу отчёта...\n\n(Здесь будет логика сбора данных)")
+        # Здесь можно добавить дальнейшую логику сбора отчёта
+    elif query.data == 'cancel_report':
+        await query.edit_message_text(text="❌ Отчёт отменён.")
+
+# --- Обработка текстовых сообщений ---
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    username = update.effective_user.username
+
+    if text == "✅ Сдать отчёт":
+        if not username:
+            await update.message.reply_text("❌ У вас не установлен username в Telegram.")
             return
-        names = "\n".join([f"• {m['full_name']} (@{m['username']})" for m in managers])
-        msg = f"⏰ Доброе утро! Сегодня на смене:\n{names}\nНе забудьте сдать отчёты: /report"
-        await context.bot.send_message(CHAT_ID, msg)
-        logger.info("Утренняя напоминалка отправлена.")
-    except Exception as e:
-        logger.error(f"Ошибка в напоминалке: {e}")
 
-# ========================= ГЛАВНАЯ ФУНКЦИЯ =========================
-async def main():
-    # 1. Запускаем заглушку для Render
-    await start_web_server()
+        can_report, message = check_can_submit_report(username)
+        await update.message.reply_text(message)
 
-    # 2. Создаем приложение
+    elif text == "❓ Помощь":
+        await update.message.reply_text(
+            "ℹ️ Как пользоваться ботом:\n\n"
+            "1. Убедитесь, что у вас установлен username в Telegram\n"
+            "2. Ваш username должен совпадать с никнеймом в таблице (лист 'СПРАВОЧНИКИ')\n"
+            "3. Нажмите «✅ Сдать отчёт»\n"
+            "4. Бот проверит вашу смену по графику\n"
+            "5. Если всё ОК — можно сдавать отчёт\n\n"
+            "Если возникли проблемы — обратитесь к администратору."
+        )
+    else:
+        await update.message.reply_text(
+            "Используйте кнопки внизу экрана:\n"
+            "✅ Сдать отчёт — проверить график и начать отчёт\n"
+            "❓ Помощь — инструкция"
+        )
+
+# --- Обработка ошибок ---
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Ошибка: {context.error}")
+    if update and update.effective_message:
+        await update.effective_message.reply_text(
+            "❌ Произошла ошибка. Попробуйте позже."
+        )
+
+# --- Главная функция ---
+def main():
+    if not BOT_TOKEN:
+        logger.error("❌ Не указан BOT_TOKEN в переменных окружения!")
+        return
+
+    if not GOOGLE_SHEETS_CREDENTIALS:
+        logger.error("❌ Не указаны GOOGLE_CREDENTIALS в переменных окружения!")
+        return
+
+    # Создаем приложение
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # 3. Регистрируем хендлеры
+    # Регистрируем обработчики
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("report", report_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CallbackQueryHandler(button_handler, pattern="^submit_report$"))
+    app.add_handler(CommandHandler("report", report))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
 
-    # 4. Планировщик
-    scheduler = AsyncIOScheduler(timezone=str(MOSCOW_TZ))
-    # Будем слать напоминалку в 09:00 утра
-    scheduler.add_job(send_reminder, 'cron', hour=9, minute=0, args=[app])
-    scheduler.start()
-    logger.info("Планировщик запущен.")
-
-    # 5. Поллинг
-    logger.info("Бот запущен и готов к работе!")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-
-    await asyncio.Event().wait()
+    # Запускаем бота
+    logger.info("🚀 Бот запущен и готов к работе!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
