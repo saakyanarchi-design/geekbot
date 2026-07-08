@@ -3,8 +3,10 @@ import datetime
 import logging
 import os
 import json
+import gspread
+from google.oauth2 import service_account
 from typing import List, Dict, Optional
-
+from google.oauth2 import service_account
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
