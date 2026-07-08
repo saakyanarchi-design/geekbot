@@ -4,16 +4,27 @@ import datetime
 import logging
 import os
 import json
-import gspread
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from google.oauth2 import service_account
 from typing import List, Dict, Optional
-from google.oauth2 import service_account
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# Библиотеки Google
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2 import service_account
+
+# Библиотеки Telegram
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    CallbackQueryHandler, 
+    MessageHandler, 
+    filters, 
+    ContextTypes
+)
+
+# Планировщик
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ---------------------------------------------------------
 # НАСТРОЙКИ ЛОГИРОВАНИЯ
