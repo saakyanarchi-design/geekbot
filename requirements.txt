@@ -1,7 +1,6 @@
-   python-telegram-bot
-   Flask
-   gspread
-   oauth2client
-   google-api-python-client
-   pytz
-   aiohttp
+python-telegram-bot>=20.3
+Flask>=2.3.0
+google-api-python-client>=2.86.0
+google-auth>=2.17.0
+pytz>=2023.3
+aiohttp>=3.8.0
