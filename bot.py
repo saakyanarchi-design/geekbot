@@ -374,6 +374,11 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             parse_mode='HTML'
         )
 
+async def process_report_responses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстовых сообщений"""
+    # Ваша логика обработки текстовых ответов
+    pass
+
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик ошибок"""
     logger.error(f"Ошибка: {context.error}")
@@ -424,7 +429,6 @@ async def send_reminder(bot):
     except Exception as e:
         logger.error(f"Ошибка в напоминалке: {e}")
 
-# ---------------------------------------------------------
 # ---------------------------------------------------------
 # ЗАПУСК БОТА
 # ---------------------------------------------------------
@@ -490,17 +494,27 @@ async def main_async():
         logger.info("⏹ Бот остановлен")
         await application.shutdown()
 
+def main():
+    """Синхронная обертка для запуска асинхронного кода"""
+    # Запускаем микро-сервер для Render
     def run_dummy_server():
         class HealthCheckHandler(BaseHTTPRequestHandler):
-            def log_message(self, format, *args): return # Отключает лишний спам в логах
+            def log_message(self, format, *args): 
+                pass  # Отключает лишний спам в логах
             def do_GET(self):
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b"OK")
+            def do_HEAD(self):
+                self.send_response(200)
+                self.end_headers()
 
         server = HTTPServer(('0.0.0.0', int(os.getenv("PORT", 10000))), HealthCheckHandler)
         server.serve_forever()
 
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
