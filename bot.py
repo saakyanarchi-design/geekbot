@@ -425,7 +425,8 @@ async def send_reminder(bot):
         logger.error(f"Ошибка в напоминалке: {e}")
 
 # ---------------------------------------------------------
-# ЗАПУСК БОТА (♻️ ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# ---------------------------------------------------------
+# ЗАПУСК БОТА
 # ---------------------------------------------------------
 
 async def main_async():
@@ -447,6 +448,7 @@ async def main_async():
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("report", cmd_report))
     application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="submit_report"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_report_responses))
     application.add_error_handler(error_handler)
 
     # Настраиваем планировщик (московское время)
@@ -467,13 +469,12 @@ async def main_async():
         args=[application.bot],
         id="reminder_19_30"
     )
-    scheduler.start()  # ✅ Теперь планировщик запускается внутри event loop
+    scheduler.start()
     logger.info("✅ Планировщик запущен (напоминания в 14:50 и 19:30)")
 
-    # Запускаем бота с очисткой старых обновлений
+    # Запускаем бота
     logger.info("🤖 Бот запущен и готов к работе!")
 
-    # ✅ Используем асинхронный запуск
     await application.initialize()
     await application.start()
     await application.updater.start_polling(
@@ -483,7 +484,6 @@ async def main_async():
 
     # Держим бота запущенным
     try:
-        # Ожидаем пока бот работает
         while True:
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, SystemExit):
@@ -491,8 +491,9 @@ async def main_async():
         await application.shutdown()
 
 def main():
-        # Добавляем этот блок:
- def run_dummy_server():
+    """Синхронная обертка для запуска асинхронного кода"""
+    # Добавляем этот блок для Render, чтобы он видел порт
+    def run_dummy_server():
         server = HTTPServer(('0.0.0.0', int(os.getenv("PORT", 10000))), BaseHTTPRequestHandler)
         server.serve_forever()
 
@@ -500,9 +501,6 @@ def main():
     # -------------------
 
     asyncio.run(main_async())
-
-    """Синхронная обертка для запуска асинхронного кода"""
-    asyncio.run(main_async())  # ✅ Явно создаем event loop
 
 if __name__ == "__main__":
     main()
