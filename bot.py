@@ -92,7 +92,7 @@ def init_google_sheets():
         return None
 
 def get_spreadsheet():
-    """Получение таблицы по имени"""
+    """получение таблицы по имени"""
     if not client:
         init_google_sheets()
     if not client:
@@ -111,7 +111,7 @@ def get_spreadsheet():
 # ---------------------------------------------------------
 
 def get_active_managers_for_today() -> List[Dict[str, str]]:
-    """Получение списка активных менеджеров на сегодня по графику"""
+    """получение списка активных менеджеров на сегодня по графику"""
     try:
         spreadsheet = get_spreadsheet()
         if not spreadsheet:
@@ -180,7 +180,7 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
 # ---------------------------------------------------------
 
 def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
-    """Получение данных менеджера с листа текущего дня"""
+    """получение данных менеджера с листа текущего дня"""
     try:
         spreadsheet = get_spreadsheet()
         if not spreadsheet:
@@ -309,7 +309,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
     spreadsheet = get_spreadsheet()
     if not spreadsheet:
         await query.edit_message_text(
-            "❌ <b>Ошибка подключения к таблице!</b>\n"
+            "❌ <b>Ошибка подключения к таблице!</b>\n\nПодробнее в логах Render.\n"
             "Пожалуйста, попробуйте позже.",
             parse_mode='HTML'
         )
@@ -379,9 +379,10 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         )
 
     except Exception as e:
-        logger.error(f"Ошибка при отправке отчёта: {e}")
+        logger.error(f"Ошибка при отправке отчёта: {e}", exc_info=True)
         await query.edit_message_text(
             f"❌ <b>Произошла ошибка!</b>\n\n"
+            f"Ошибка: {e}\n"
             f"Пожалуйста, попробуйте позже или сообщите администратору.",
             parse_mode='HTML'
         )
