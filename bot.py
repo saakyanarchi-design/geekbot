@@ -211,10 +211,10 @@ def format_manager_report(data: Dict[str, str]) -> str:
     """Форматирование отчета менеджера для отправки"""
     return (
         f"📊 <b>ОТЧЕТ ПРИНЯТ</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"──────────────────────\n"
         f"👤 <b>Менеджер:</b> {data['full_name']}\n"
         f"📅 <b>Дата:</b> {datetime.datetime.now().strftime('%d.%m.%Y')}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"──────────────────────\n"
         f"🔹 <b>Лиды:</b> {data['leads']}\n"
         f"🔹 <b>Звонки:</b> {data['calls']}\n"
         f"🔹 <b>Рассылка:</b> {data['mailing']}\n"
@@ -225,7 +225,7 @@ def format_manager_report(data: Dict[str, str]) -> str:
         f"💰 <b>Оплаты:</b> {data['payments_count']} шт. на сумму {data['payments_sum']}₽\n"
         f"📈 <b>CVR:</b> {data['cvr']}%\n"
         f"🔹 <b>Некачественные:</b> {data['non_quality']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
+        f"──────────────────────"
     )
 
 # ---------------------------------------------------------
