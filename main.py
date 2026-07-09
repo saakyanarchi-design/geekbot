@@ -1,7 +1,6 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import threading
-import asyncio
 import logging
 import os
 import sys
@@ -196,10 +195,10 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
             return []
 
         candidates = []
-        # ИСПРАВЛЕНИЕ: Проходим по строкам правильно
+        # ИСПРАВЛЕНИЕ: Проходим по строкам правильно, берем ячейки по индексу
         for row in ref_data[1:]:
-            # row - это список ячеек: [ФИО, Username, ...]
             if len(row) >= 2:
+                # row - ФИО, row - Username
                 name_val = str(row).strip()
                 username_val = str(row).strip().replace("@", "").lower()
                 
@@ -544,10 +543,13 @@ def main():
                 self.send_response(200)
                 self.end_headers()
 
-        port = int(os.getenv("PORT", 10000))
-        server = HTTPServer(('0.0.0.0', port), Handler)
-        logger.info(f"Health check server on port {port}")
-        server.serve_forever()
+        try:
+            port = int(os.getenv("PORT", 10000))
+            server = HTTPServer(('0.0.0.0', port), Handler)
+            logger.info(f"Health check server on port {port}")
+            server.serve_forever()
+        except Exception as e:
+            logger.error(f"Ошибка запуска Health Check: {e}")
 
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
