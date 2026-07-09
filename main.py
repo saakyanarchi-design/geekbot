@@ -1,15 +1,7 @@
 from datetime import datetime
-from zoneinfo import ZoneInfo # Для Python 3.9+
-
-# Замени все вызовы datetime.now() на datetime.now(ZoneInfo("Europe/Moscow"))
-# Но проще всего: в функции get_manager_day_data замени:
-# now = datetime.datetime.now()
-# на:
-now = datetime.now(ZoneInfo("Europe/Moscow"))
-
+from zoneinfo import ZoneInfo
 import threading
 import asyncio
-import datetime
 import logging
 import os
 import sys
@@ -32,6 +24,15 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ---------------------------------------------------------
+# НАСТРОЙКА ЧАСОВОГО ПОЯСА
+# ---------------------------------------------------------
+TZ_MOSCOW = ZoneInfo("Europe/Moscow")
+
+def get_now_moscow() -> datetime:
+    """Возвращает текущее время в Москве."""
+    return datetime.now(TZ_MOSCOW)
+
+# ---------------------------------------------------------
 # ЛОГИРОВАНИЕ
 # ---------------------------------------------------------
 logging.basicConfig(
@@ -50,25 +51,37 @@ REF_SHEET_NAME = "СПРАВОЧНИКИ"
 SCHEDULE_SHEET_NAME = "График"
 
 # ---------------------------------------------------------
-# GOOGLE SHEETS - ПОЛНОСТЬЮ ИСПРАВЛЕНО
+# GOOGLE SHEETS - ИСПРАВЛЕНО (включая фрагмент со скриншота)
 # ---------------------------------------------------------
 
 def init_google_sheets():
     try:
-        # Проверяем, есть ли JSON-строка в GOOGLE_CREDENTIALS
         creds_json = os.getenv("GOOGLE_CREDENTIALS")
+        creds = None
 
+        # Вариант 1: Если весь JSON ключ передан в одной переменной
         if creds_json and creds_json.strip().startswith("{"):
-            # Парсим JSON строку
             creds_dict = json.loads(creds_json)
-            creds = service_account.Credentials.from_service_account_info(creds_dict)
+            # ВАЖНО: Явно передаем scopes для исправления invalid_scope
+            creds = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=[
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive.file"
+                ]
+            )
         else:
-            # Собираем credentials из отдельных переменных
+            # Вариант 2: Сборка из отдельных переменных (как на вашем скриншоте)
+            # ИСПРАВЛЕНИЕ: Корректная замена экранированных переносов строк
+            raw_key = os.getenv("PRIVATE_KEY", "")
+            # Render часто передает \n как \\n, нужно превратить в реальный перенос
+            clean_key = raw_key.replace("\\n", "\n")
+            
             creds_dict = {
                 "type": "service_account",
                 "project_id": os.getenv("PROJECT_ID"),
                 "private_key_id": os.getenv("PRIVATE_KEY_ID"),
-                "private_key": os.getenv("PRIVATE_KEY", "").replace("\\n", "\n"),
+                "private_key": clean_key,
                 "client_email": os.getenv("CLIENT_EMAIL"),
                 "client_id": os.getenv("CLIENT_ID"),
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
@@ -76,33 +89,45 @@ def init_google_sheets():
                 "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
                 "client_x509_cert_url": os.getenv("CLIENT_CERT_URL")
             }
-            creds = service_account.Credentials.from_service_account_info(creds_dict)
+            
+            creds = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=[
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive.file"
+                ]
+            )
+
+        if not creds:
+            logger.error("Не удалось создать credentials")
+            return None
 
         client = gspread.authorize(creds)
 
         spreadsheet_id = os.getenv("SPREADSHEET_ID")
         if spreadsheet_id:
-            logger.info(f"Подключено к таблице по ID: {spreadsheet_id[:20]}...")
+            logger.info(f"Подключение к таблице по ID: {spreadsheet_id[:10]}...")
             return client.open_by_key(spreadsheet_id)
 
-        logger.info(f"Подключено к таблице по имени: {SPREADSHEET_NAME}")
+        logger.info(f"Подключение к таблице по имени: {SPREADSHEET_NAME}")
         return client.open(SPREADSHEET_NAME)
 
     except Exception as e:
         logger.error(f"Критическая ошибка Google Sheets: {e}", exc_info=True)
         return None
 
-# Глобальный клиент
 client = None
 
 def get_spreadsheet():
     global client
     if client is None:
-        logger.info("Инициализируем Google Sheets клиент...")
+        logger.info("Инициализация клиента Google Sheets...")
         client = init_google_sheets()
+    
     if client is None:
         logger.error("❌ Клиент не инициализирован")
         return None
+    
     try:
         return client.open(SPREADSHEET_NAME)
     except Exception as e:
@@ -110,7 +135,7 @@ def get_spreadsheet():
         return None
 
 # ---------------------------------------------------------
-# ПОЛУЧЕНИЕ МЕНЕДЖЕРОВ И ДАННЫХ
+# ЛОГИКА ДАННЫХ (С УЧЕТОМ ЧАСОВОГО ПОЯСА)
 # ---------------------------------------------------------
 
 def get_active_managers_for_today() -> List[Dict[str, str]]:
@@ -124,10 +149,10 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
 
         candidates = []
         for row in ref_data[1:]:
-            if len(row) >= 2 and row[0].strip() and row[1].strip():
+            if len(row) >= 2 and row.strip() and row.strip():
                 candidates.append({
-                    "full_name": row[0].strip(),
-                    "username": row[1].strip().replace("@", "")
+                    "full_name": row.strip(),
+                    "username": row.strip().replace("@", "")
                 })
 
         if not candidates:
@@ -140,10 +165,11 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
             logger.warning("График пуст")
             return []
 
-        today = datetime.datetime.now()
-        today_str = str(today.day)
+        # ИСПРАВЛЕНО: Используем московское время
+        now = get_now_moscow()
+        today_str = str(now.day)
 
-        header = schedule_data[0]
+        header = schedule_data
         col_idx = -1
         for i, val in enumerate(header):
             if str(val).strip() == today_str:
@@ -151,13 +177,13 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
                 break
 
         if col_idx == -1:
-            logger.warning(f"Колонка даты {today_str} не найдена в графике")
+            logger.warning(f"Колонка даты {today_str} не найдена в графике. Доступные: {header}")
             return []
 
         schedule_map = {}
         for row in schedule_data[1:]:
-            if len(row) > col_idx and row[0].strip():
-                name = row[0].strip()
+            if len(row) > col_idx and row.strip():
+                name = row.strip()
                 val = str(row[col_idx]).strip().lower()
                 is_working = val in ["true", "1", "да", "✓", "✔", "yes", "+", "работает"]
                 schedule_map[name] = is_working
@@ -179,11 +205,13 @@ def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
         if not spreadsheet:
             return None
 
-        now = datetime.datetime.now()
+        # ИСПРАВЛЕНО: Используем московское время
+        now = get_now_moscow()
+        
         sheet_names_to_try = [
             str(now.day),
             f"{now.day:02d}",
-            str(now.day) + " " + now.strftime("%B")[:3],
+            f"{now.day} {now.strftime('%B')[:3]}", # 9 Jul
             f"{now.day}.{now.month:02d}"
         ]
 
@@ -197,13 +225,15 @@ def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
                 continue
 
         if not day_sheet:
+            # Финальный поиск по точному совпадению заголовка
             for ws in spreadsheet.worksheets():
                 ws_title = ws.title.strip()
                 if ws_title == str(now.day) or ws_title == f"{now.day:02d}":
                     day_sheet = ws
                     break
+            
             if not day_sheet:
-                logger.warning(f"Лист для {now.day} не найден")
+                logger.warning(f"Лист для {now.day} не найден среди листов: {[s.title for s in spreadsheet.worksheets()]}")
                 return None
 
         all_data = day_sheet.get_all_values()
@@ -212,7 +242,7 @@ def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
 
         row_num = None
         for i, row in enumerate(all_data):
-            if row and row[0].strip().lower() == full_name.lower():
+            if row and row.strip().lower() == full_name.lower():
                 row_num = i
                 break
 
@@ -246,11 +276,13 @@ def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
         return None
 
 def format_manager_report(data: Dict[str, str]) -> str:
+    # ИСПРАВЛЕНО: Дата в отчете теперь тоже московская
+    report_date = get_now_moscow().strftime('%d.%m.%Y')
     return (
         f"📊 <b>ОТЧЕТ ПРИНЯТ</b>\n"
         f"──────────────────────\n"
         f"👤 <b>Менеджер:</b> {data['full_name']}\n"
-        f"📅 <b>Дата:</b> {datetime.datetime.now().strftime('%d.%m.%Y')}\n"
+        f"📅 <b>Дата:</b> {report_date}\n"
         f"──────────────────────\n"
         f"🔹 <b>Лиды:</b> {data['leads']}\n"
         f"🔹 <b>Звонки:</b> {data['calls']}\n"
@@ -266,7 +298,7 @@ def format_manager_report(data: Dict[str, str]) -> str:
     )
 
 # ---------------------------------------------------------
-# ХЕНДЛЕРЫ
+# ОБРАБОТЧИКИ TELEGRAM
 # ---------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -316,9 +348,9 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         full_name = None
         for row in ref_data[1:]:
             if len(row) >= 2:
-                ref_username = row[1].strip().replace("@", "").lower()
+                ref_username = row.strip().replace("@", "").lower()
                 if ref_username == username.lower():
-                    full_name = row[0].strip()
+                    full_name = row.strip()
                     break
 
         if not full_name:
@@ -334,9 +366,11 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         is_on_shift = any(m["full_name"] == full_name for m in active_managers)
 
         if not is_on_shift:
+            # ИСПРАВЛЕНО: Дата в сообщении тоже московская
+            current_date_str = get_now_moscow().strftime('%d.%m.%Y')
             await query.edit_message_text(
                 f"❌ <b>Вы не на смене по графику!</b>\n\n"
-                f"Сегодня ({datetime.datetime.now().strftime('%d.%m.%Y')}) "
+                f"Сегодня ({current_date_str}) "
                 f"вас нет в графике работы.",
                 parse_mode='HTML'
             )
@@ -360,7 +394,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             parse_mode='HTML'
         )
 
-        current_time = datetime.datetime.now().strftime('%d.%m.%Y %H:%M')
+        current_time = get_now_moscow().strftime('%d.%m.%Y %H:%M')
         await query.edit_message_text(
             f"✅ <b>Отчёт успешно отправлен!</b>\n\n"
             f"📅 {current_time}",
@@ -422,7 +456,7 @@ async def send_reminder(bot):
         logger.error(f"Ошибка в send_reminder: {e}")
 
 # ---------------------------------------------------------
-# ЗАПУСК - ЕДИНСТВЕННАЯ ТОЧКА ЗАПУСКА
+# ЗАПУСК
 # ---------------------------------------------------------
 
 async def main_async():
@@ -432,14 +466,11 @@ async def main_async():
         logger.error("❌ BOT_TOKEN не найден!")
         sys.exit(1)
 
-    # Инициализируем Google Sheets
     global client
     client = init_google_sheets()
 
-    # Создаём приложение
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Регистрируем обработчики
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("report", cmd_report))
     application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="submit_report"))
@@ -452,7 +483,6 @@ async def main_async():
     scheduler.start()
     logger.info("✅ Планировщик запущен (14:50, 19:30 МСК)")
 
-    # ЕДИНСТВЕННЫЙ запуск: удаляем webhook, инициализируем, стартуем
     try:
         await application.bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook удалён, все ожидающие обновления сброшены")
@@ -470,7 +500,6 @@ async def main_async():
 
     logger.info("🤖 Бот успешно запущен!")
 
-    # Держим процесс живым
     try:
         while True:
             await asyncio.sleep(3600)
