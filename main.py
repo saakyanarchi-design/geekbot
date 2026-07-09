@@ -1,3 +1,12 @@
+from datetime import datetime
+from zoneinfo import ZoneInfo # Для Python 3.9+
+
+# Замени все вызовы datetime.now() на datetime.now(ZoneInfo("Europe/Moscow"))
+# Но проще всего: в функции get_manager_day_data замени:
+# now = datetime.datetime.now()
+# на:
+now = datetime.now(ZoneInfo("Europe/Moscow"))
+
 import threading
 import asyncio
 import datetime
