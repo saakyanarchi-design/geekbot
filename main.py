@@ -42,6 +42,7 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 
 if not BOT_TOKEN:
     logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Переменная окружения BOT_TOKEN не найдена!")
+    logger.error("Зайдите в Render Dashboard -> Settings -> Environment Variables и добавьте ключ BOT_TOKEN")
     sys.exit(1)
 
 if CHAT_ID:
@@ -52,10 +53,11 @@ if CHAT_ID:
 
 REF_SHEET_NAME = "СПРАВОЧНИКИ"
 SCHEDULE_SHEET_NAME = "График"
+
 _spreadsheet_cache = None
 
 # ---------------------------------------------------------
-# GOOGLE SHEETS
+# GOOGLE SHEETS: АВТОРИЗАЦИЯ (ИСПРАВЛЕНО И ДОПИСАНО)
 # ---------------------------------------------------------
 def init_google_sheets() -> Optional[gspread.Spreadsheet]:
     try:
@@ -66,15 +68,22 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
         creds = None
         creds_json = os.getenv("GOOGLE_CREDENTIALS")
 
+        # Вариант 1: Полный JSON в переменной окружения
         if creds_json and creds_json.strip().startswith("{"):
             creds_dict = json.loads(creds_json)
             creds = service_account.Credentials.from_service_account_info(
                 creds_dict,
-                scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
+                scopes=[
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive.file"
+                ]
             )
         else:
+            # Вариант 2: Сбор ключей из отдельных переменных (для Render удобно)
             raw_key = os.getenv("PRIVATE_KEY", "")
+            # Исправляем экранирование переносов строк, если ключ скопирован неправильно
             clean_key = raw_key.replace("\\n", "\n")
+            
             creds_dict = {
                 "type": "service_account",
                 "project_id": os.getenv("PROJECT_ID"),
@@ -87,9 +96,13 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
                 "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
                 "client_x509_cert_url": os.getenv("CLIENT_CERT_URL")
             }
+            
             creds = service_account.Credentials.from_service_account_info(
                 creds_dict,
-                scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
+                scopes=[
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive.file"
+                ]
             )
 
         if not creds:
@@ -98,6 +111,7 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
 
         client = gspread.authorize(creds)
         logger.info(f"📂 Подключение к таблице по ID: {SPREADSHEET_ID[:10]}...")
+        
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
         logger.info(f"✅ Таблица успешно подключена: {spreadsheet.title}")
         return spreadsheet
@@ -124,9 +138,11 @@ def normalize_name(name_str: str) -> str:
     return str(name_str).replace(".", "").strip().lower()
 
 def match_names(name_in_table: str, name_to_find: str) -> bool:
-    t, f = normalize_name(name_in_table), normalize_name(name_to_find)
+    t = normalize_name(name_in_table)
+    f = normalize_name(name_to_find)
     if t == f: return True
-    t_parts, f_parts = t.split(), f.split()
+    t_parts = t.split()
+    f_parts = f.split()
     if not t_parts or not f_parts: return False
     return t_parts == f_parts
 
@@ -144,7 +160,6 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         spreadsheet = get_spreadsheet()
         if not spreadsheet: return []
 
-        # Получаем лист справочников
         try:
             ref_sheet = spreadsheet.worksheet(REF_SHEET_NAME)
         except gspread.exceptions.WorksheetNotFound:
@@ -154,7 +169,6 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         ref_data = ref_sheet.get_all_values()
         if len(ref_data) < 2: return []
 
-        # Формируем список кандидатов (имя, username)
         candidates = []
         for row in ref_data[1:]:
             if len(row) >= 2:
@@ -165,7 +179,6 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
 
         if not candidates: return []
 
-        # Получаем лист графика
         try:
             schedule_sheet = spreadsheet.worksheet(SCHEDULE_SHEET_NAME)
         except gspread.exceptions.WorksheetNotFound:
@@ -179,13 +192,16 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         today_str = str(now.day)
         header = schedule_data if schedule_data else []
         
-        # Ищем колонку с сегодняшней датой
-        col_idx = next((i for i, val in enumerate(header) if str(val).strip() == today_str), -1)
+        col_idx = -1
+        for i, val in enumerate(header):
+            if str(val).strip() == today_str:
+                col_idx = i
+                break
+        
         if col_idx == -1:
             logger.warning(f"Колонка даты {today_str} не найдена. Заголовки: {header}")
             return []
 
-        # Создаем карту: имя -> работает ли сегодня
         schedule_map = {}
         for row in schedule_data[1:]:
             if len(row) > col_idx:
@@ -194,13 +210,14 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
                 is_working = val in ["true", "1", "да", "✓", "✔", "yes", "+", "работает"]
                 schedule_map[name] = is_working
 
-        # Фильтруем активных менеджеров
         active = []
         for cand in candidates:
-            found_name = next((sched_name for sched_name, is_on in schedule_map.items() 
-                               if match_names(sched_name, cand["full_name"]) and is_on), None)
-            if found_name:
-                active.append(cand)
+            found_name = None
+            for sched_name, is_on in schedule_map.items():
+                if match_names(sched_name, cand["full_name"]) and is_on:
+                    found_name = sched_name
+                    break
+            if found_name: active.append(cand)
 
         logger.info(f"✅ Активных менеджеров сегодня: {len(active)}")
         return active
@@ -215,7 +232,6 @@ def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
 
         now = get_now_moscow()
         day = now.day
-        # Варианты названий листов, которые мы пробуем найти
         sheet_names_to_try = [
             str(day), 
             f"{day:02d}", 
@@ -237,9 +253,12 @@ def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
         all_data = day_sheet.get_all_values()
         if not all_data: return None
 
-        # Ищем строку с именем менеджера
-        row_num = next((i for i, row in enumerate(all_data) 
-                        if row and match_names(str(row).strip(), full_name)), None)
+        row_num = None
+        for i, row in enumerate(all_data):
+            if row and len(row) > 0:
+                if match_names(str(row).strip(), full_name):
+                    row_num = i
+                    break
         
         if row_num is None: return None
 
@@ -313,8 +332,15 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
     try:
         ref_sheet = spreadsheet.worksheet(REF_SHEET_NAME)
         ref_data = ref_sheet.get_all_values()
-        full_name = next((str(row).strip() for row in ref_data[1:] 
-                          if len(row) >= 2 and str(row).strip().replace("@", "").lower() == username.lower()), None)
+        full_name = None
+        
+        # Исправленный поиск: берем row и row, а не всю строку
+        for row in ref_data[1:]:
+            if len(row) >= 2:
+                ref_username = str(row).strip().replace("@", "").lower()
+                if ref_username == username.lower():
+                    full_name = str(row).strip()
+                    break
 
         if not full_name:
             await query.edit_message_text(f"❌ <b>Вы не найдены в списке менеджеров!</b>\nВаш username: @{username}", parse_mode='HTML')
@@ -370,10 +396,9 @@ async def main_async():
     application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="^submit_report\$"))
     application.add_error_handler(error_handler)
 
-    # Инициализация планировщика
     scheduler = AsyncIOScheduler(timezone=TZ_MOSCOW)
     
-    # Добавляем задачи
+    # Задачи планировщика
     scheduler.add_job(send_reminder, 'cron', hour=14, minute=50, args=[application.bot])
     scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
     
