@@ -1,7 +1,6 @@
 import os
 import sys
 import logging
-import threading
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -43,7 +42,6 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 
 if not BOT_TOKEN:
     logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Переменная окружения BOT_TOKEN не найдена!")
-    logger.error("Зайдите в Render Dashboard -> Settings -> Environment Variables и добавьте ключ BOT_TOKEN")
     sys.exit(1)
 
 if CHAT_ID:
@@ -56,6 +54,7 @@ REF_SHEET_NAME = "СПРАВОЧНИКИ"
 SCHEDULE_SHEET_NAME = "График"
 
 _spreadsheet_cache = None
+_gs_lock = asyncio.Lock()  # Блокировка для безопасного доступа к Google Sheets
 
 # ---------------------------------------------------------
 # GOOGLE SHEETS: АВТОРИЗАЦИЯ
@@ -69,7 +68,6 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
         creds = None
         creds_json = os.getenv("GOOGLE_CREDENTIALS")
 
-        # Вариант 1: Полный JSON в переменной окружения
         if creds_json and creds_json.strip().startswith("{"):
             creds_dict = json.loads(creds_json)
             creds = service_account.Credentials.from_service_account_info(
@@ -80,7 +78,6 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
                 ]
             )
         else:
-            # Вариант 2: Сбор ключей из отдельных переменных
             raw_key = os.getenv("PRIVATE_KEY", "")
             clean_key = raw_key.replace("\\n", "\n")
             
@@ -123,12 +120,14 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
         logger.error(f"❌ Критическая ошибка Google Sheets: {e}", exc_info=True)
         return None
 
-def get_spreadsheet() -> Optional[gspread.Spreadsheet]:
+async def get_spreadsheet() -> Optional[gspread.Spreadsheet]:
     global _spreadsheet_cache
-    if _spreadsheet_cache is None:
-        logger.info("🔄 Инициализация клиента Google Sheets...")
-        _spreadsheet_cache = init_google_sheets()
-    return _spreadsheet_cache
+    # Используем блокировку, чтобы не создавать 100 подключений одновременно
+    async with _gs_lock:
+        if _spreadsheet_cache is None:
+            logger.info("🔄 Инициализация клиента Google Sheets...")
+            _spreadsheet_cache = init_google_sheets()
+        return _spreadsheet_cache
 
 # ---------------------------------------------------------
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -155,9 +154,9 @@ def get_cell_value(row: List[str], index: int, default: str = "0") -> str:
 # ---------------------------------------------------------
 # ЛОГИКА ДАННЫХ
 # ---------------------------------------------------------
-def get_active_managers_for_today() -> List[Dict[str, str]]:
+async def get_active_managers_for_today() -> List[Dict[str, str]]:
     try:
-        spreadsheet = get_spreadsheet()
+        spreadsheet = await get_spreadsheet()
         if not spreadsheet: return []
 
         try:
@@ -172,7 +171,6 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         candidates = []
         for row in ref_data[1:]:
             if len(row) >= 2:
-                # ИСПРАВЛЕНО: берем конкретные ячейки, а не всю строку
                 name_val = str(row).strip()
                 username_val = str(row).strip().replace("@", "").lower()
                 if name_val and username_val:
@@ -206,7 +204,6 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         schedule_map = {}
         for row in schedule_data[1:]:
             if len(row) > col_idx:
-                # ИСПРАВЛЕНО: берем имя из первой колонки
                 name = str(row).strip()
                 val = str(row[col_idx]).strip().lower()
                 is_working = val in ["true", "1", "да", "✓", "✔", "yes", "+", "работает"]
@@ -227,9 +224,9 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         logger.error(f"❌ Ошибка get_active_managers: {e}", exc_info=True)
         return []
 
-def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
+async def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
     try:
-        spreadsheet = get_spreadsheet()
+        spreadsheet = await get_spreadsheet()
         if not spreadsheet: return None
 
         now = get_now_moscow()
@@ -326,7 +323,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("❌ <b>Ошибка!</b>\nУ вас не заполнен Username в Telegram.", parse_mode='HTML')
         return
 
-    spreadsheet = get_spreadsheet()
+    spreadsheet = await get_spreadsheet()
     if not spreadsheet:
         await query.edit_message_text("❌ <b>Ошибка подключения к таблице!</b>", parse_mode='HTML')
         return
@@ -336,7 +333,6 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         ref_data = ref_sheet.get_all_values()
         full_name = None
         
-        # ИСПРАВЛЕНО: корректный перебор строк и ячеек
         for row in ref_data[1:]:
             if len(row) >= 2:
                 ref_username = str(row).strip().replace("@", "").lower()
@@ -348,7 +344,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text(f"❌ <b>Вы не найдены в списке менеджеров!</b>\nВаш username: @{username}", parse_mode='HTML')
             return
 
-        active_managers = get_active_managers_for_today()
+        active_managers = await get_active_managers_for_today()
         is_on_shift = any(match_names(m["full_name"], full_name) for m in active_managers)
 
         if not is_on_shift:
@@ -356,7 +352,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text(f"❌ <b>Вы не на смене по графику!</b>\nСегодня ({current_date_str}) вас нет в листе.", parse_mode='HTML')
             return
 
-        manager_data = get_manager_day_data(full_name)
+        manager_data = await get_manager_day_data(full_name)
         if not manager_data:
             await query.edit_message_text("❌ <b>Ошибка получения данных!</b>", parse_mode='HTML')
             return
@@ -385,8 +381,8 @@ async def send_reminder(bot):
     except Exception as e:
         logger.error(f"❌ Ошибка отправки напоминания: {e}")
 
-def start_scheduler(application):
-    """Запускает планировщик в отдельном потоке, чтобы не блокировать цикл бота"""
+async def start_scheduler(application):
+    """Запускает планировщик в том же event loop, что и бот"""
     scheduler = AsyncIOScheduler(timezone=TZ_MOSCOW)
     
     # Задачи планировщика
@@ -394,29 +390,32 @@ def start_scheduler(application):
     scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
     
     scheduler.start()
-    logger.info("✅ Планировщик запущен в отдельном потоке (напоминания: 14:50 и 19:30)")
+    logger.info("✅ Планировщик запущен (напоминания: 14:50 и 19:30)")
 
 # ---------------------------------------------------------
 # ЗАПУСК
 # ---------------------------------------------------------
-def main():
+async def main_async():
     logger.info("🤖 Инициализация приложения бота...")
     
     application = Application.builder().token(BOT_TOKEN).build()
     
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("report", cmd_report))
-    # ИСПРАВЛЕНО: raw string для паттерна, чтобы убрать SyntaxWarning
+    # ИСПРАВЛЕНО: raw string для паттерна
     application.add_handler(CallbackQueryHandler(process_callback_submit, pattern=r"^submit_report\$"))
     application.add_error_handler(error_handler)
 
-    # Запускаем планировщик в отдельном потоке
-    scheduler_thread = threading.Thread(target=start_scheduler, args=(application,), daemon=True)
-    scheduler_thread.start()
+    # Запускаем планировщик асинхронно ПЕРЕД запуском polling
+    await start_scheduler(application)
 
-    logger.info("🚀 Запуск бота в режиме polling (блокирующий вызов)...")
-    # run_polling сам управляет своим Event Loop, поэтому asyncio.run не нужен
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("🚀 Запуск бота в режиме polling...")
+    # run_polling сам управляет своим Event Loop
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+def main():
+    # Просто запускаем асинхронную функцию
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
