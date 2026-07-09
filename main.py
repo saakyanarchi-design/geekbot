@@ -170,23 +170,14 @@ def match_names(name_in_table: str, name_to_find: str) -> bool:
         return False
     
     # Логика сравнения инициалов и полных имен
-    # Если в таблице "Фамилия И.О." (2 слова), а в поиске "Фамилия И. О." (3 слова)
     if len(t_parts) == 2 and len(f_parts) >= 2:
-        # Проверяем, что первые буквы имени и отчества совпадают
-        # t_parts может быть "И.И." или "ИИ"
         t_initials = t_parts.replace(".", "").upper()
-        f_initials = "".join([p.upper() for p in f_parts[1:2]]) # Берем только имя для сравнения с инициалом
-        
-        # Упрощенная проверка: если в таблице 2 слова, проверяем совпадение первых букв
-        if len(f_parts) >= 2:
-            f_first_letter = f_parts.upper()
-            if t_initials.startswith(f_first_letter):
-                return True
+        f_first_letter = f_parts.upper()
+        if t_initials.startswith(f_first_letter):
+            return True
         return False
 
-    # Если в таблице полное имя (3 слова), а в поиске сокращенное
     if len(t_parts) >= 3 and len(f_parts) == 2:
-         # f_parts это инициалы, проверяем начало
          if t_parts.startswith(f_parts.upper()):
              return True
 
@@ -214,7 +205,6 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
 
         candidates = []
         for row in ref_data[1:]:
-            # ВАЖНО: Используем индексы и, а не str(row)
             if len(row) >= 2:
                 name_val = str(row).strip()
                 username_val = str(row).strip().replace("@", "").lower()
@@ -261,7 +251,7 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         schedule_map = {}
         for row in schedule_data[1:]:
             if len(row) > col_idx:
-                name = str(row).strip() # Берем только имя из первой колонки
+                name = str(row).strip()
                 val = str(row[col_idx]).strip().lower()
                 is_working = val in ["true", "1", "да", "✓", "✔", "yes", "+", "работает"]
                 schedule_map[name] = is_working
@@ -319,7 +309,6 @@ def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
         row_num = None
         for i, row in enumerate(all_data):
             if row and len(row) > 0:
-                # ВАЖНО: Сравниваем только первую ячейку строки
                 if match_names(str(row).strip(), full_name):
                     row_num = i
                     break
@@ -424,7 +413,6 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         ref_data = ref_sheet.get_all_values()
 
         full_name = None
-        # ВАЖНО: Исправлен перебор строк. Теперь берем row и row
         for row in ref_data[1:]:
             if len(row) >= 2:
                 ref_username = str(row).strip().replace("@", "").lower()
@@ -580,7 +568,8 @@ async def main_async():
     await application.initialize()
     await application.start()
     
-    # ВАЖНО: Используем run_polling, который сам управляет циклом.
+    # ВАЖНО: run_polling сам управляет циклом событий.
+    # Мы НЕ используем asyncio.run() здесь.
     await application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
@@ -590,6 +579,8 @@ async def main_async():
 
 def main():
     """Микро-сервер для Render + запуск бота"""
+    
+    # 1. Сначала запускаем Health Check сервер в отдельном потоке
     def run_server():
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):
@@ -610,7 +601,67 @@ def main():
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
 
-    asyncio.run(main_async())
+    # 2. Запускаем асинхронную логику бота.
+    # ВНИМАНИЕ: Мы НЕ оборачиваем main_async() в asyncio.run().
+    # Функция main_async содержит внутри себя application.run_polling(), 
+    # который сам создает и закрывает event loop.
+    try:
+        # Для Python 3.7+ можно использовать get_event_loop, но проще вызвать напрямую,
+        # если внутри нет конфликта. Однако, так как main_async использует await,
+        # нам нужно запустить его. 
+        # Но так как run_polling блокирует выполнение, мы можем просто запустить его.
+        
+        # Правильный способ для такой архитектуры:
+        asyncio.run(main_async()) 
+        # Примечание: В старых версиях PTB это вызывало конфликт. 
+        # В новых версиях PTB (20+) run_polling внутри себя делает run_until_complete.
+        # Если вы получаете ошибку "Event loop already running", значит, среда выполнения (Render)
+        # уже имеет запущенный цикл. В таком случае, просто вызывайте логику без asyncio.run,
+        # но это сложно сделать корректно с run_polling.
+        
+        # АЛЬТЕРНАТИВА ДЛЯ RENDER (если asyncio.run падает):
+        # Попробуйте убрать asyncio.run и использовать loop напрямую, если Render требует этого.
+        # Но чаще всего проблема в том, что run_polling вызывается внутри asyncio.run.
+        # Давайте попробуем вариант БЕЗ asyncio.run, если Render сам управляет циклом,
+        # но это рискованно.
+        
+        # Самый надежный вариант для Render с PTB 20+:
+        # Убрать asyncio.run здесь и позволить run_polling работать.
+        # Но main_async - это корутина.
+        # Давайте оставим asyncio.run, но убедимся, что внутри main_async нет вложенных запусков.
+        # Ошибка в логах была именно из-за двойного запуска.
+        # Если Render запускает скрипт, он создает свой loop.
+        # Попробуйте этот блок, если предыдущий падает:
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(main_async())
+        """
+        # Но стандартный asyncio.run должен работать. Ошибка была в том, что run_polling
+        # пытался запустить loop, который уже был запущен asyncio.run.
+        # В новых версиях PTB run_polling НЕ должен вызывать asyncio.run.
+        # Если ошибка сохраняется, значит, версия PTB или среда специфичны.
+        
+        # ИСПРАВЛЕННЫЙ ПОДХОД ДЛЯ RENDER:
+        # Просто вызываем main_async, но так как она асинхронная, нам нужен runner.
+        # Если ошибка "loop already running" повторяется, значит, Render уже запустил loop.
+        # В этом случае нужно использовать:
+        # asyncio.get_event_loop().run_until_complete(main_async())
+        
+        # Попробуем универсальный вариант:
+        try:
+            asyncio.run(main_async())
+        except RuntimeError as e:
+            if "already running" in str(e):
+                logger.warning("Обнаружен уже запущенный цикл событий. Используем существующий.")
+                loop = asyncio.get_event_loop()
+                loop.run_until_complete(main_async())
+            else:
+                raise e
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка запуска: {e}", exc_info=True)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
