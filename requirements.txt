@@ -1,4 +1,8 @@
-python-telegram-bot>=20.0,<21.0
+python-telegram-bot>=20.0
 gspread
-oauth2client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
 apscheduler
+httpx
+python-dotenv
