@@ -17,8 +17,6 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
-    filters,
     ContextTypes
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -46,23 +44,37 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID", "-1003813207765"))
-SPREADSHEET_NAME = "Отчёты/ Срезы ОТБ Июль"
+# Название используется только для отладки, основное подключение по ID
+SPREADSHEET_NAME_DEBUG = "Отчёты/ Срезы ОТБ Июль" 
 REF_SHEET_NAME = "СПРАВОЧНИКИ"
 SCHEDULE_SHEET_NAME = "График"
 
+# Глобальная переменная для хранения объекта таблицы
+_spreadsheet_cache = None
+
 # ---------------------------------------------------------
-# GOOGLE SHEETS - ИСПРАВЛЕНО (включая фрагмент со скриншота)
+# GOOGLE SHEETS - ИСПРАВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ
 # ---------------------------------------------------------
 
-def init_google_sheets():
+def init_google_sheets() -> Optional[gspread.Spreadsheet]:
+    """
+    Инициализирует клиент и открывает таблицу.
+    ВАЖНО: Использует open_by_key для надежности.
+    """
     try:
+        spreadsheet_id = os.getenv("SPREADSHEET_ID")
+        
+        if not spreadsheet_id:
+            logger.error("❌ Переменная окружения SPREADSHEET_ID не задана!")
+            logger.error("   Получите ID из URL таблицы (между /d/ и /edit) и добавьте в Render.")
+            return None
+
         creds_json = os.getenv("GOOGLE_CREDENTIALS")
         creds = None
 
         # Вариант 1: Если весь JSON ключ передан в одной переменной
         if creds_json and creds_json.strip().startswith("{"):
             creds_dict = json.loads(creds_json)
-            # ВАЖНО: Явно передаем scopes для исправления invalid_scope
             creds = service_account.Credentials.from_service_account_info(
                 creds_dict,
                 scopes=[
@@ -71,10 +83,8 @@ def init_google_sheets():
                 ]
             )
         else:
-            # Вариант 2: Сборка из отдельных переменных (как на вашем скриншоте)
-            # ИСПРАВЛЕНИЕ: Корректная замена экранированных переносов строк
+            # Вариант 2: Сборка из отдельных переменных
             raw_key = os.getenv("PRIVATE_KEY", "")
-            # Render часто передает \n как \\n, нужно превратить в реальный перенос
             clean_key = raw_key.replace("\\n", "\n")
             
             creds_dict = {
@@ -99,43 +109,46 @@ def init_google_sheets():
             )
 
         if not creds:
-            logger.error("Не удалось создать credentials")
+            logger.error("❌ Не удалось создать credentials")
             return None
 
         client = gspread.authorize(creds)
+        
+        logger.info(f"📂 Подключение к таблице по ID: {spreadsheet_id[:10]}...")
+        
+        # ГЛАВНОЕ ИСПРАВЛЕНИЕ: Используем open_by_key вместо open()
+        # Это предотвращает ошибку 'Spreadsheet' object has no attribute 'open'
+        spreadsheet = client.open_by_key(spreadsheet_id)
+        
+        logger.info(f"✅ Таблица успешно подключена: {spreadsheet.title}")
+        return spreadsheet
 
-        spreadsheet_id = os.getenv("SPREADSHEET_ID")
-        if spreadsheet_id:
-            logger.info(f"Подключение к таблице по ID: {spreadsheet_id[:10]}...")
-            return client.open_by_key(spreadsheet_id)
-
-        logger.info(f"Подключение к таблице по имени: {SPREADSHEET_NAME}")
-        return client.open(SPREADSHEET_NAME)
-
+    except gspread.exceptions.SpreadsheetNotFound:
+        logger.error(f"❌ Таблица с ID {os.getenv('SPREADSHEET_ID')} не найдена. Проверьте ID и права доступа.")
+        return None
     except Exception as e:
-        logger.error(f"Критическая ошибка Google Sheets: {e}", exc_info=True)
+        logger.error(f"❌ Критическая ошибка Google Sheets: {e}", exc_info=True)
         return None
 
-client = None
-
-def get_spreadsheet():
-    global client
-    if client is None:
-        logger.info("Инициализация клиента Google Sheets...")
-        client = init_google_sheets()
+def get_spreadsheet() -> Optional[gspread.Spreadsheet]:
+    """
+    Возвращает объект таблицы из кэша.
+    Не пытается открывать таблицу заново, чтобы избежать ошибок атрибутов.
+    """
+    global _spreadsheet_cache
     
-    if client is None:
-        logger.error("❌ Клиент не инициализирован")
+    if _spreadsheet_cache is None:
+        logger.info("🔄 Инициализация клиента Google Sheets...")
+        _spreadsheet_cache = init_google_sheets()
+    
+    if _spreadsheet_cache is None:
+        logger.error("❌ Клиент не инициализирован или таблица недоступна")
         return None
     
-    try:
-        return client.open(SPREADSHEET_NAME)
-    except Exception as e:
-        logger.error(f"Не могу открыть таблицу '{SPREADSHEET_NAME}': {e}")
-        return None
+    return _spreadsheet_cache
 
 # ---------------------------------------------------------
-# ЛОГИКА ДАННЫХ (С УЧЕТОМ ЧАСОВОГО ПОЯСА)
+# ЛОГИКА ДАННЫХ
 # ---------------------------------------------------------
 
 def get_active_managers_for_today() -> List[Dict[str, str]]:
@@ -144,46 +157,66 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         if not spreadsheet:
             return []
 
-        ref_sheet = spreadsheet.worksheet(REF_SHEET_NAME)
+        # Проверка наличия листа СПРАВОЧНИКИ
+        try:
+            ref_sheet = spreadsheet.worksheet(REF_SHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            logger.error(f"❌ Лист '{REF_SHEET_NAME}' не найден в таблице!")
+            return []
+
         ref_data = ref_sheet.get_all_values()
+        if len(ref_data) < 2:
+            logger.warning("⚠️ Справочник пуст или содержит только заголовок")
+            return []
 
         candidates = []
         for row in ref_data[1:]:
-            if len(row) >= 2 and row.strip() and row.strip():
-                candidates.append({
-                    "full_name": row.strip(),
-                    "username": row.strip().replace("@", "")
-                })
+            if len(row) >= 2:
+                # Защита от пустых строк и лишних пробелов
+                name_val = str(row).strip()
+                username_val = str(row).strip()
+                if name_val and username_val:
+                    candidates.append({
+                        "full_name": name_val,
+                        "username": username_val.replace("@", "")
+                    })
 
         if not candidates:
             logger.warning("Нет кандидатов в справочнике")
             return []
 
-        schedule_sheet = spreadsheet.worksheet(SCHEDULE_SHEET_NAME)
+        # Проверка наличия листа График
+        try:
+            schedule_sheet = spreadsheet.worksheet(SCHEDULE_SHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            logger.error(f"❌ Лист '{SCHEDULE_SHEET_NAME}' не найден!")
+            return []
+
         schedule_data = schedule_sheet.get_all_values()
         if not schedule_data:
             logger.warning("График пуст")
             return []
 
-        # ИСПРАВЛЕНО: Используем московское время
         now = get_now_moscow()
         today_str = str(now.day)
 
-        header = schedule_data
+        header = schedule_data if schedule_data else []
         col_idx = -1
+        
+        # Ищем колонку с сегодняшним днем
         for i, val in enumerate(header):
             if str(val).strip() == today_str:
                 col_idx = i
                 break
 
         if col_idx == -1:
-            logger.warning(f"Колонка даты {today_str} не найдена в графике. Доступные: {header}")
+            logger.warning(f"Колонка даты {today_str} не найдена в графике. Доступные заголовки: {header}")
             return []
 
         schedule_map = {}
         for row in schedule_data[1:]:
-            if len(row) > col_idx and row.strip():
-                name = row.strip()
+            if len(row) > col_idx:
+                name = str(row).strip()
                 val = str(row[col_idx]).strip().lower()
                 is_working = val in ["true", "1", "да", "✓", "✔", "yes", "+", "работает"]
                 schedule_map[name] = is_working
@@ -193,10 +226,10 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
             if schedule_map.get(cand["full_name"], False):
                 active.append(cand)
 
-        logger.info(f"Активных менеджеров сегодня: {len(active)}")
+        logger.info(f"✅ Активных менеджеров сегодня: {len(active)}")
         return active
     except Exception as e:
-        logger.error(f"Ошибка get_active_managers: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка get_active_managers: {e}", exc_info=True)
         return []
 
 def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
@@ -205,78 +238,82 @@ def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
         if not spreadsheet:
             return None
 
-        # ИСПРАВЛЕНО: Используем московское время
         now = get_now_moscow()
+        day = now.day
         
+        # Варианты названий листов, которые мы будем искать
         sheet_names_to_try = [
-            str(now.day),
-            f"{now.day:02d}",
-            f"{now.day} {now.strftime('%B')[:3]}", # 9 Jul
-            f"{now.day}.{now.month:02d}"
+            str(day),
+            f"{day:02d}",
+            f"{day} {now.strftime('%B')[:3]}", 
+            f"{day}.{now.month:02d}"
         ]
 
         day_sheet = None
         for name in sheet_names_to_try:
             try:
                 day_sheet = spreadsheet.worksheet(name)
-                logger.info(f"Найден лист: {name}")
+                logger.info(f"📄 Найден лист для отчета: {name}")
                 break
             except gspread.exceptions.WorksheetNotFound:
                 continue
 
+        # Если не нашли по шаблону, пробуем точное совпадение с существующими листами
         if not day_sheet:
-            # Финальный поиск по точному совпадению заголовка
             for ws in spreadsheet.worksheets():
                 ws_title = ws.title.strip()
-                if ws_title == str(now.day) or ws_title == f"{now.day:02d}":
+                if ws_title == str(day) or ws_title == f"{day:02d}":
                     day_sheet = ws
                     break
-            
-            if not day_sheet:
-                logger.warning(f"Лист для {now.day} не найден среди листов: {[s.title for s in spreadsheet.worksheets()]}")
-                return None
+        
+        if not day_sheet:
+            logger.error(f"❌ Лист для {day} не найден. Проверьте, создан ли лист с названием '{day}' в таблице.")
+            logger.info(f"  Доступные листы: {[s.title for s in spreadsheet.worksheets()]}")
+            return None
 
         all_data = day_sheet.get_all_values()
         if not all_data:
+            logger.warning(f"Лист {day_sheet.title} пуст")
             return None
 
         row_num = None
         for i, row in enumerate(all_data):
-            if row and row.strip().lower() == full_name.lower():
-                row_num = i
-                break
+            if row and len(row) > 0:
+                if str(row).strip().lower() == full_name.lower():
+                    row_num = i
+                    break
 
         if row_num is None:
             logger.warning(f"'{full_name}' не найден на листе {day_sheet.title}")
             return None
 
-        def safe(row, col, default="0"):
-            if col < len(row):
-                v = row[col].strip()
+        target = all_data[row_num]
+        
+        def safe(col_index, default="0"):
+            if col_index < len(target):
+                v = str(target[col_index]).strip()
                 return v if v else default
             return default
 
-        target = all_data[row_num]
         return {
             "full_name": full_name,
-            "leads": safe(target, 1),
-            "calls": safe(target, 2),
-            "mailing": safe(target, 3),
-            "vk_requests": safe(target, 4),
-            "vk_checks": safe(target, 5),
-            "deadlines": safe(target, 6),
-            "invoices": safe(target, 7),
-            "payments_count": safe(target, 8),
-            "payments_sum": safe(target, 9),
-            "cvr": safe(target, 10),
-            "non_quality": safe(target, 11)
+            "leads": safe(1),
+            "calls": safe(2),
+            "mailing": safe(3),
+            "vk_requests": safe(4),
+            "vk_checks": safe(5),
+            "deadlines": safe(6),
+            "invoices": safe(7),
+            "payments_count": safe(8),
+            "payments_sum": safe(9),
+            "cvr": safe(10),
+            "non_quality": safe(11)
         }
     except Exception as e:
-        logger.error(f"get_manager_day_data error: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка get_manager_day_data: {e}", exc_info=True)
         return None
 
 def format_manager_report(data: Dict[str, str]) -> str:
-    # ИСПРАВЛЕНО: Дата в отчете теперь тоже московская
     report_date = get_now_moscow().strftime('%d.%m.%Y')
     return (
         f"📊 <b>ОТЧЕТ ПРИНЯТ</b>\n"
@@ -327,7 +364,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
     if not username:
         await query.edit_message_text(
             "❌ <b>Ошибка!</b>\n\nУ вас не заполнен Username в Telegram.\n"
-            "Пожалуйста, установите его в настройках: Настройки → Имя пользователя",
+            "Пожалуйста, установите его в настройках.",
             parse_mode='HTML'
         )
         return
@@ -335,8 +372,9 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
     spreadsheet = get_spreadsheet()
     if not spreadsheet:
         await query.edit_message_text(
-            "❌ <b>Ошибка подключения к таблице!</b>\n\nПодробнее в логах Render.\n"
-            "Пожалуйста, попробуйте позже.",
+            "❌ <b>Ошибка подключения к таблице!</b>\n\n"
+            "Сервис временно недоступен. Попробуйте через 5 минут.\n"
+            "(Проверьте логи Render: возможно, неверный SPREADSHEET_ID)",
             parse_mode='HTML'
         )
         return
@@ -348,16 +386,16 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         full_name = None
         for row in ref_data[1:]:
             if len(row) >= 2:
-                ref_username = row.strip().replace("@", "").lower()
+                ref_username = str(row).strip().replace("@", "").lower()
                 if ref_username == username.lower():
-                    full_name = row.strip()
+                    full_name = str(row).strip()
                     break
 
         if not full_name:
             await query.edit_message_text(
                 f"❌ <b>Вы не найдены в списке менеджеров!</b>\n\n"
                 f"Ваш username: @{username}\n"
-                f"Обратитесь к администратору, чтобы вас добавили в таблицу.",
+                f"Обратитесь к администратору, чтобы вас добавили в лист '{REF_SHEET_NAME}'.",
                 parse_mode='HTML'
             )
             return
@@ -366,12 +404,10 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         is_on_shift = any(m["full_name"] == full_name for m in active_managers)
 
         if not is_on_shift:
-            # ИСПРАВЛЕНО: Дата в сообщении тоже московская
             current_date_str = get_now_moscow().strftime('%d.%m.%Y')
             await query.edit_message_text(
                 f"❌ <b>Вы не на смене по графику!</b>\n\n"
-                f"Сегодня ({current_date_str}) "
-                f"вас нет в графике работы.",
+                f"Сегодня ({current_date_str}) вас нет в листе '{SCHEDULE_SHEET_NAME}'.",
                 parse_mode='HTML'
             )
             return
@@ -381,8 +417,9 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         if not manager_data:
             await query.edit_message_text(
                 f"❌ <b>Ошибка получения данных!</b>\n\n"
-                f"Ваши данные не найдены на листе текущего дня. "
-                f"Возможно, вы не заполнили таблицу.",
+                f"Не удалось найти ваши данные на листе текущего дня.\n"
+                f"Убедитесь, что в таблице создан лист с названием '{get_now_moscow().day}' "
+                f"и вы есть в этом листе.",
                 parse_mode='HTML'
             )
             return
@@ -401,12 +438,19 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             parse_mode='HTML'
         )
 
-    except Exception as e:
-        logger.error(f"Ошибка при отправке отчёта: {e}", exc_info=True)
+    except gspread.exceptions.WorksheetNotFound as e:
+        logger.error(f"Лист не найден: {e}")
         await query.edit_message_text(
-            f"❌ <b>Произошла ошибка!</b>\n\n"
-            f"Ошибка: {e}\n"
-            f"Пожалуйста, попробуйте позже или сообщите администратору.",
+            "❌ <b>Ошибка структуры таблицы!</b>\n\n"
+            "Один из необходимых листов (СПРАВОЧНИКИ, График или лист дня) отсутствует.",
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error(f"❌ Ошибка при отправке отчёта: {e}", exc_info=True)
+        await query.edit_message_text(
+            f"❌ <b>Произошла внутренняя ошибка!</b>\n\n"
+            f"Ошибка: {str(e)}\n"
+            f"Сообщите администратору.",
             parse_mode='HTML'
         )
 
@@ -451,9 +495,9 @@ async def send_reminder(bot):
             parse_mode='HTML',
             reply_markup=kb
         )
-        logger.info(f"Напоминание отправлено. Менеджеров: {len(managers)}")
+        logger.info(f"✅ Напоминание отправлено. Менеджеров: {len(managers)}")
     except Exception as e:
-        logger.error(f"Ошибка в send_reminder: {e}")
+        logger.error(f"❌ Ошибка в send_reminder: {e}")
 
 # ---------------------------------------------------------
 # ЗАПУСК
@@ -466,8 +510,14 @@ async def main_async():
         logger.error("❌ BOT_TOKEN не найден!")
         sys.exit(1)
 
-    global client
-    client = init_google_sheets()
+    # Инициализируем таблицу сразу при старте
+    global _spreadsheet_cache
+    _spreadsheet_cache = init_google_sheets()
+    
+    if _spreadsheet_cache is None:
+        logger.error("❌ Критическая ошибка: не удалось подключиться к Google Sheets. Бот не будет запущен.")
+        # Не делаем sys.exit(1), чтобы Render мог показать логи, но и не запускаем приложение
+        return
 
     application = Application.builder().token(BOT_TOKEN).build()
 
