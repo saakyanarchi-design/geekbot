@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import threading
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -57,7 +58,7 @@ SCHEDULE_SHEET_NAME = "График"
 _spreadsheet_cache = None
 
 # ---------------------------------------------------------
-# GOOGLE SHEETS: АВТОРИЗАЦИЯ (ИСПРАВЛЕНО И ДОПИСАНО)
+# GOOGLE SHEETS: АВТОРИЗАЦИЯ
 # ---------------------------------------------------------
 def init_google_sheets() -> Optional[gspread.Spreadsheet]:
     try:
@@ -79,9 +80,8 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
                 ]
             )
         else:
-            # Вариант 2: Сбор ключей из отдельных переменных (для Render удобно)
+            # Вариант 2: Сбор ключей из отдельных переменных
             raw_key = os.getenv("PRIVATE_KEY", "")
-            # Исправляем экранирование переносов строк, если ключ скопирован неправильно
             clean_key = raw_key.replace("\\n", "\n")
             
             creds_dict = {
@@ -172,6 +172,7 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         candidates = []
         for row in ref_data[1:]:
             if len(row) >= 2:
+                # ИСПРАВЛЕНО: берем конкретные ячейки, а не всю строку
                 name_val = str(row).strip()
                 username_val = str(row).strip().replace("@", "").lower()
                 if name_val and username_val:
@@ -205,6 +206,7 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         schedule_map = {}
         for row in schedule_data[1:]:
             if len(row) > col_idx:
+                # ИСПРАВЛЕНО: берем имя из первой колонки
                 name = str(row).strip()
                 val = str(row[col_idx]).strip().lower()
                 is_working = val in ["true", "1", "да", "✓", "✔", "yes", "+", "работает"]
@@ -334,7 +336,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         ref_data = ref_sheet.get_all_values()
         full_name = None
         
-        # Исправленный поиск: берем row и row, а не всю строку
+        # ИСПРАВЛЕНО: корректный перебор строк и ячеек
         for row in ref_data[1:]:
             if len(row) >= 2:
                 ref_username = str(row).strip().replace("@", "").lower()
@@ -383,19 +385,8 @@ async def send_reminder(bot):
     except Exception as e:
         logger.error(f"❌ Ошибка отправки напоминания: {e}")
 
-# ---------------------------------------------------------
-# ЗАПУСК
-# ---------------------------------------------------------
-async def main_async():
-    logger.info("🤖 Инициализация приложения бота...")
-    
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("report", cmd_report))
-    application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="^submit_report\$"))
-    application.add_error_handler(error_handler)
-
+def start_scheduler(application):
+    """Запускает планировщик в отдельном потоке, чтобы не блокировать цикл бота"""
     scheduler = AsyncIOScheduler(timezone=TZ_MOSCOW)
     
     # Задачи планировщика
@@ -403,17 +394,29 @@ async def main_async():
     scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
     
     scheduler.start()
-    logger.info("✅ Планировщик запущен (напоминания: 14:50 и 19:30)")
+    logger.info("✅ Планировщик запущен в отдельном потоке (напоминания: 14:50 и 19:30)")
 
-    logger.info("🚀 Запуск бота в режиме polling...")
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
-
+# ---------------------------------------------------------
+# ЗАПУСК
+# ---------------------------------------------------------
 def main():
-    try:
-        asyncio.run(main_async())
-    except Exception as e:
-        logger.critical(f"💥 Критический сбой запуска: {e}", exc_info=True)
-        sys.exit(1)
+    logger.info("🤖 Инициализация приложения бота...")
+    
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("report", cmd_report))
+    # ИСПРАВЛЕНО: raw string для паттерна, чтобы убрать SyntaxWarning
+    application.add_handler(CallbackQueryHandler(process_callback_submit, pattern=r"^submit_report\$"))
+    application.add_error_handler(error_handler)
+
+    # Запускаем планировщик в отдельном потоке
+    scheduler_thread = threading.Thread(target=start_scheduler, args=(application,), daemon=True)
+    scheduler_thread.start()
+
+    logger.info("🚀 Запуск бота в режиме polling (блокирующий вызов)...")
+    # run_polling сам управляет своим Event Loop, поэтому asyncio.run не нужен
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
