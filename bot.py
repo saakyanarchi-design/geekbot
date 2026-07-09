@@ -4,7 +4,7 @@ import datetime
 import logging
 import os
 import sys
-import json  # обязательно
+import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import List, Dict, Optional
 
@@ -41,69 +41,46 @@ REF_SHEET_NAME = "СПРАВОЧНИКИ"
 SCHEDULE_SHEET_NAME = "График"
 
 # ---------------------------------------------------------
-# GOOGLE SHEETS - ИСПРАВЛЕНО
+# GOOGLE SHEETS - ПОЛНОСТЬЮ ИСПРАВЛЕНО
 # ---------------------------------------------------------
 
 def init_google_sheets():
-    """Инициализация Google Sheets API - исправленная версия"""
     try:
-        SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-
-        # Получаем GOOGLE_CREDENTIALS
+        # Проверяем, есть ли JSON-строка в GOOGLE_CREDENTIALS
         creds_json = os.getenv("GOOGLE_CREDENTIALS")
-        if creds_json:
-            # Это строка JSON - парсим
-            try:
-                creds_dict = json.loads(creds_json)
-            except json.JSONDecodeError as e:
-                logger.error(f"GOOGLE_CREDENTIALS невалидный JSON: {e}")
-                return None
-        else:
-            # Или собираем из отдельных переменных
-            logger.info("Собираем credentials из отдельных переменных...")
-            private_key = os.getenv("PRIVATE_KEY", "")
-            if private_key and "\\n" in private_key:
-                private_key = private_key.replace("\\n", "\n")
-            elif private_key and "\\n" not in private_key and "-----BEGIN PRIVATE KEY-----\n" not in private_key:
-                private_key = None
 
+        if creds_json and creds_json.strip().startswith("{"):
+            # Парсим JSON строку
+            creds_dict = json.loads(creds_json)
+            creds = service_account.Credentials.from_service_account_info(creds_dict)
+        else:
+            # Собираем credentials из отдельных переменных
             creds_dict = {
                 "type": "service_account",
-                "project_id": os.getenv("PROJECT_ID", ""),
-                "private_key_id": os.getenv("PRIVATE_KEY_ID", ""),
-                "private_key": private_key,
-                "client_email": os.getenv("CLIENT_EMAIL", ""),
-                "client_id": os.getenv("CLIENT_ID", ""),
+                "project_id": os.getenv("PROJECT_ID"),
+                "private_key_id": os.getenv("PRIVATE_KEY_ID"),
+                "private_key": os.getenv("PRIVATE_KEY", "").replace("\\n", "\n"),
+                "client_email": os.getenv("CLIENT_EMAIL"),
+                "client_id": os.getenv("CLIENT_ID"),
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
                 "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-                "client_x509_cert_url": os.getenv("CLIENT_CERT_URL", "")
+                "client_x509_cert_url": os.getenv("CLIENT_CERT_URL")
             }
+            creds = service_account.Credentials.from_service_account_info(creds_dict)
 
-        # Проверка обязательных полей
-        required = ["private_key", "client_email", "client_id"]
-        missing = [f for f in required if not creds_dict.get(f)]
-        if missing:
-            logger.error(f"Нет обязательных credentials: {', '.join(missing)}")
-            logger.error(f"Все ключи в creds_dict: {list(creds_dict.keys())}")
-            logger.error(f"private_key пустой: {creds_dict.get('private_key') is None}")
-            logger.error(f"client_email пустой: {creds_dict.get('client_email') is None}")
-            return None
-
-        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         client = gspread.authorize(creds)
 
-        # Получаем ID таблицы
         spreadsheet_id = os.getenv("SPREADSHEET_ID")
-        if not spreadsheet_id:
-            logger.error("SPREADSHEET_ID не задан")
-            return None
+        if spreadsheet_id:
+            logger.info(f"Подключено к таблице по ID: {spreadsheet_id[:20]}...")
+            return client.open_by_key(spreadsheet_id)
 
-        sheet = client.open_by_key(spreadsheet_id)
-        logger.info(f"✅ Подключено к таблице: {sheet.title} (ID: {spreadsheet_id[:20]}...)")
-        return client
+        logger.info(f"Подключено к таблице по имени: {SPREADSHEET_NAME}")
+        return client.open(SPREADSHEET_NAME)
+
     except Exception as e:
-        logger.error(f"Ошибка Google Sheets: {e}", exc_info=True)
+        logger.error(f"Критическая ошибка Google Sheets: {e}", exc_info=True)
         return None
 
 # Глобальный клиент
@@ -194,7 +171,6 @@ def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
             return None
 
         now = datetime.datetime.now()
-        # Пробуем названия в разном формате
         sheet_names_to_try = [
             str(now.day),
             f"{now.day:02d}",
@@ -212,7 +188,6 @@ def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
                 continue
 
         if not day_sheet:
-            # Пробуем найти любой лист с числом
             for ws in spreadsheet.worksheets():
                 ws_title = ws.title.strip()
                 if ws_title == str(now.day) or ws_title == f"{now.day:02d}":
@@ -438,7 +413,7 @@ async def send_reminder(bot):
         logger.error(f"Ошибка в send_reminder: {e}")
 
 # ---------------------------------------------------------
-# ЗАПУСК - ИСПРАВЛЕНО ДЛЯ ПРЕДОТВРАЩЕНИЯ КОНФЛИКТА
+# ЗАПУСК - ЕДИНСТВЕННАЯ ТОЧКА ЗАПУСКА
 # ---------------------------------------------------------
 
 async def main_async():
@@ -468,19 +443,15 @@ async def main_async():
     scheduler.start()
     logger.info("✅ Планировщик запущен (14:50, 19:30 МСК)")
 
-    # КЛЮЧЕВОЙ МОМЕНТ: удаляем webhook И сбрасываем очередь
+    # ЕДИНСТВЕННЫЙ запуск: удаляем webhook, инициализируем, стартуем
     try:
         await application.bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook удалён, все ожидающие обновления сброшены")
     except Exception as e:
         logger.warning(f"Не удалось удалить webhook: {e}")
 
-    # Запускаем приложение
     await application.initialize()
     await application.start()
-
-    # Запускаем polling с дополнительными мерами защиты от конфликтов
-    # Увеличиваем timeout и делаем одноразовый сброс
     await application.updater.start_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
@@ -503,7 +474,7 @@ def main():
     def run_server():
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):
-                pass  # не выводим логи запросов
+                pass
             def do_GET(self):
                 self.send_response(200)
                 self.end_headers()
@@ -517,11 +488,9 @@ def main():
         logger.info(f"Health check server on port {port}")
         server.serve_forever()
 
-    # Запускаем сервер в отдельном потоке
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
 
-    # Запускаем бота
     asyncio.run(main_async())
 
 if __name__ == "__main__":
