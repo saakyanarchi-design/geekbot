@@ -44,8 +44,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID", "-1003813207765"))
-# Название используется только для отладки, основное подключение по ID
-SPREADSHEET_NAME_DEBUG = "Отчёты/ Срезы ОТБ Июль" 
 REF_SHEET_NAME = "СПРАВОЧНИКИ"
 SCHEDULE_SHEET_NAME = "График"
 
@@ -53,20 +51,18 @@ SCHEDULE_SHEET_NAME = "График"
 _spreadsheet_cache = None
 
 # ---------------------------------------------------------
-# GOOGLE SHEETS - ИСПРАВЛЕННАЯ ИНИЦИАЛИЗАЦИЯ
+# GOOGLE SHEETS - ИНИЦИАЛИЗАЦИЯ
 # ---------------------------------------------------------
 
 def init_google_sheets() -> Optional[gspread.Spreadsheet]:
     """
     Инициализирует клиент и открывает таблицу.
-    ВАЖНО: Использует open_by_key для надежности.
     """
     try:
         spreadsheet_id = os.getenv("SPREADSHEET_ID")
         
         if not spreadsheet_id:
             logger.error("❌ Переменная окружения SPREADSHEET_ID не задана!")
-            logger.error("   Получите ID из URL таблицы (между /d/ и /edit) и добавьте в Render.")
             return None
 
         creds_json = os.getenv("GOOGLE_CREDENTIALS")
@@ -113,28 +109,21 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
             return None
 
         client = gspread.authorize(creds)
-        
         logger.info(f"📂 Подключение к таблице по ID: {spreadsheet_id[:10]}...")
         
-        # ГЛАВНОЕ ИСПРАВЛЕНИЕ: Используем open_by_key вместо open()
-        # Это предотвращает ошибку 'Spreadsheet' object has no attribute 'open'
         spreadsheet = client.open_by_key(spreadsheet_id)
-        
         logger.info(f"✅ Таблица успешно подключена: {spreadsheet.title}")
         return spreadsheet
 
     except gspread.exceptions.SpreadsheetNotFound:
-        logger.error(f"❌ Таблица с ID {os.getenv('SPREADSHEET_ID')} не найдена. Проверьте ID и права доступа.")
+        logger.error(f"❌ Таблица с ID {os.getenv('SPREADSHEET_ID')} не найдена.")
         return None
     except Exception as e:
         logger.error(f"❌ Критическая ошибка Google Sheets: {e}", exc_info=True)
         return None
 
 def get_spreadsheet() -> Optional[gspread.Spreadsheet]:
-    """
-    Возвращает объект таблицы из кэша.
-    Не пытается открывать таблицу заново, чтобы избежать ошибок атрибутов.
-    """
+    """Возвращает объект таблицы из кэша."""
     global _spreadsheet_cache
     
     if _spreadsheet_cache is None:
@@ -148,6 +137,62 @@ def get_spreadsheet() -> Optional[gspread.Spreadsheet]:
     return _spreadsheet_cache
 
 # ---------------------------------------------------------
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С ИМЕНАМИ
+# ---------------------------------------------------------
+
+def normalize_name(name_str: str) -> str:
+    """Приводит имя к нижнему регистру, убирает лишние пробелы и точки."""
+    if not name_str:
+        return ""
+    clean = str(name_str).replace(".", "").strip().lower()
+    return clean
+
+def match_names(name_in_table: str, name_to_find: str) -> bool:
+    """
+    Сравнивает имена с учетом сокращений.
+    Пример: 'Иванов И.И.' и 'Иванов Иван Иванович' -> True
+    """
+    t = normalize_name(name_in_table)
+    f = normalize_name(name_to_find)
+    
+    # 1. Полное совпадение
+    if t == f:
+        return True
+    
+    t_parts = t.split()
+    f_parts = f.split()
+    
+    if not t_parts or not f_parts:
+        return False
+
+    # Проверка фамилии (первое слово)
+    if t_parts != f_parts:
+        return False
+    
+    # Логика сравнения инициалов и полных имен
+    # Если в таблице "Фамилия И.О." (2 слова), а в поиске "Фамилия И. О." (3 слова)
+    if len(t_parts) == 2 and len(f_parts) >= 2:
+        # Проверяем, что первые буквы имени и отчества совпадают
+        # t_parts может быть "И.И." или "ИИ"
+        t_initials = t_parts.replace(".", "").upper()
+        f_initials = "".join([p.upper() for p in f_parts[1:2]]) # Берем только имя для сравнения с инициалом
+        
+        # Упрощенная проверка: если в таблице 2 слова, проверяем совпадение первых букв
+        if len(f_parts) >= 2:
+            f_first_letter = f_parts.upper()
+            if t_initials.startswith(f_first_letter):
+                return True
+        return False
+
+    # Если в таблице полное имя (3 слова), а в поиске сокращенное
+    if len(t_parts) >= 3 and len(f_parts) == 2:
+         # f_parts это инициалы, проверяем начало
+         if t_parts.startswith(f_parts.upper()):
+             return True
+
+    return False
+
+# ---------------------------------------------------------
 # ЛОГИКА ДАННЫХ
 # ---------------------------------------------------------
 
@@ -157,35 +202,37 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         if not spreadsheet:
             return []
 
-        # Проверка наличия листа СПРАВОЧНИКИ
         try:
             ref_sheet = spreadsheet.worksheet(REF_SHEET_NAME)
         except gspread.exceptions.WorksheetNotFound:
-            logger.error(f"❌ Лист '{REF_SHEET_NAME}' не найден в таблице!")
+            logger.error(f"❌ Лист '{REF_SHEET_NAME}' не найден!")
             return []
 
         ref_data = ref_sheet.get_all_values()
         if len(ref_data) < 2:
-            logger.warning("⚠️ Справочник пуст или содержит только заголовок")
             return []
 
         candidates = []
         for row in ref_data[1:]:
+            # ВАЖНО: Используем индексы и, а не str(row)
             if len(row) >= 2:
-                # Защита от пустых строк и лишних пробелов
                 name_val = str(row).strip()
-                username_val = str(row).strip()
+                username_val = str(row).strip().replace("@", "").lower()
+                
+                # ГЛАВНОЕ ИЗМЕНЕНИЕ:
+                # Если username пустой — сотрудник считается уволенным и НЕ добавляется в список.
                 if name_val and username_val:
                     candidates.append({
                         "full_name": name_val,
-                        "username": username_val.replace("@", "")
+                        "username": username_val
                     })
+                elif not username_val and name_val:
+                    logger.debug(f"ℹ️ Сотрудник '{name_val}' исключен: пустой Username (вероятно, уволен).")
 
         if not candidates:
-            logger.warning("Нет кандидатов в справочнике")
+            logger.warning("Нет активных кандидатов с заполненным Username")
             return []
 
-        # Проверка наличия листа График
         try:
             schedule_sheet = spreadsheet.worksheet(SCHEDULE_SHEET_NAME)
         except gspread.exceptions.WorksheetNotFound:
@@ -194,7 +241,6 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
 
         schedule_data = schedule_sheet.get_all_values()
         if not schedule_data:
-            logger.warning("График пуст")
             return []
 
         now = get_now_moscow()
@@ -203,27 +249,32 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         header = schedule_data if schedule_data else []
         col_idx = -1
         
-        # Ищем колонку с сегодняшним днем
         for i, val in enumerate(header):
             if str(val).strip() == today_str:
                 col_idx = i
                 break
 
         if col_idx == -1:
-            logger.warning(f"Колонка даты {today_str} не найдена в графике. Доступные заголовки: {header}")
+            logger.warning(f"Колонка даты {today_str} не найдена. Заголовки: {header}")
             return []
 
         schedule_map = {}
         for row in schedule_data[1:]:
             if len(row) > col_idx:
-                name = str(row).strip()
+                name = str(row).strip() # Берем только имя из первой колонки
                 val = str(row[col_idx]).strip().lower()
                 is_working = val in ["true", "1", "да", "✓", "✔", "yes", "+", "работает"]
                 schedule_map[name] = is_working
 
         active = []
         for cand in candidates:
-            if schedule_map.get(cand["full_name"], False):
+            found_name = None
+            for sched_name, is_on in schedule_map.items():
+                if match_names(sched_name, cand["full_name"]) and is_on:
+                    found_name = sched_name
+                    break
+            
+            if found_name:
                 active.append(cand)
 
         logger.info(f"✅ Активных менеджеров сегодня: {len(active)}")
@@ -241,7 +292,6 @@ def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
         now = get_now_moscow()
         day = now.day
         
-        # Варианты названий листов, которые мы будем искать
         sheet_names_to_try = [
             str(day),
             f"{day:02d}",
@@ -257,29 +307,20 @@ def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
                 break
             except gspread.exceptions.WorksheetNotFound:
                 continue
-
-        # Если не нашли по шаблону, пробуем точное совпадение с существующими листами
-        if not day_sheet:
-            for ws in spreadsheet.worksheets():
-                ws_title = ws.title.strip()
-                if ws_title == str(day) or ws_title == f"{day:02d}":
-                    day_sheet = ws
-                    break
         
         if not day_sheet:
-            logger.error(f"❌ Лист для {day} не найден. Проверьте, создан ли лист с названием '{day}' в таблице.")
-            logger.info(f"  Доступные листы: {[s.title for s in spreadsheet.worksheets()]}")
+            logger.error(f"❌ Лист для {day} не найден.")
             return None
 
         all_data = day_sheet.get_all_values()
         if not all_data:
-            logger.warning(f"Лист {day_sheet.title} пуст")
             return None
 
         row_num = None
         for i, row in enumerate(all_data):
             if row and len(row) > 0:
-                if str(row).strip().lower() == full_name.lower():
+                # ВАЖНО: Сравниваем только первую ячейку строки
+                if match_names(str(row).strip(), full_name):
                     row_num = i
                     break
 
@@ -373,8 +414,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
     if not spreadsheet:
         await query.edit_message_text(
             "❌ <b>Ошибка подключения к таблице!</b>\n\n"
-            "Сервис временно недоступен. Попробуйте через 5 минут.\n"
-            "(Проверьте логи Render: возможно, неверный SPREADSHEET_ID)",
+            "Сервис временно недоступен.",
             parse_mode='HTML'
         )
         return
@@ -384,6 +424,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         ref_data = ref_sheet.get_all_values()
 
         full_name = None
+        # ВАЖНО: Исправлен перебор строк. Теперь берем row и row
         for row in ref_data[1:]:
             if len(row) >= 2:
                 ref_username = str(row).strip().replace("@", "").lower()
@@ -401,7 +442,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             return
 
         active_managers = get_active_managers_for_today()
-        is_on_shift = any(m["full_name"] == full_name for m in active_managers)
+        is_on_shift = any(match_names(m["full_name"], full_name) for m in active_managers)
 
         if not is_on_shift:
             current_date_str = get_now_moscow().strftime('%d.%m.%Y')
@@ -442,7 +483,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         logger.error(f"Лист не найден: {e}")
         await query.edit_message_text(
             "❌ <b>Ошибка структуры таблицы!</b>\n\n"
-            "Один из необходимых листов (СПРАВОЧНИКИ, График или лист дня) отсутствует.",
+            "Один из необходимых листов отсутствует.",
             parse_mode='HTML'
         )
     except Exception as e:
@@ -510,13 +551,11 @@ async def main_async():
         logger.error("❌ BOT_TOKEN не найден!")
         sys.exit(1)
 
-    # Инициализируем таблицу сразу при старте
     global _spreadsheet_cache
     _spreadsheet_cache = init_google_sheets()
     
     if _spreadsheet_cache is None:
-        logger.error("❌ Критическая ошибка: не удалось подключиться к Google Sheets. Бот не будет запущен.")
-        # Не делаем sys.exit(1), чтобы Render мог показать логи, но и не запускаем приложение
+        logger.error("❌ Критическая ошибка: не удалось подключиться к Google Sheets.")
         return
 
     application = Application.builder().token(BOT_TOKEN).build()
@@ -526,7 +565,6 @@ async def main_async():
     application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="submit_report"))
     application.add_error_handler(error_handler)
 
-    # Планировщик (МСК)
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(send_reminder, 'cron', hour=14, minute=50, args=[application.bot])
     scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
@@ -541,21 +579,14 @@ async def main_async():
 
     await application.initialize()
     await application.start()
-    await application.updater.start_polling(
+    
+    # ВАЖНО: Используем run_polling, который сам управляет циклом.
+    await application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
         poll_interval=1.0,
         timeout=30
     )
-
-    logger.info("🤖 Бот успешно запущен!")
-
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("⏹ Бот остановлен")
-        await application.shutdown()
 
 def main():
     """Микро-сервер для Render + запуск бота"""
