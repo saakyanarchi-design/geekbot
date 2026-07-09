@@ -1,12 +1,10 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import threading
 import logging
 import os
 import sys
 import json
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import List, Dict, Optional
+import threading
 
 import gspread
 from google.oauth2 import service_account
@@ -26,7 +24,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 TZ_MOSCOW = ZoneInfo("Europe/Moscow")
 
 def get_now_moscow() -> datetime:
-    """Возвращает текущее время в Москве."""
     return datetime.now(TZ_MOSCOW)
 
 # ---------------------------------------------------------
@@ -42,11 +39,28 @@ logger = logging.getLogger(__name__)
 # ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # ---------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID", "-1003813207765"))
+CHAT_ID = os.getenv("CHAT_ID")
+
+# Проверка критических переменных сразу при старте
+if not BOT_TOKEN:
+    logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Переменная окружения BOT_TOKEN не найдена!")
+    logger.error("Зайдите в Render Dashboard -> Settings -> Environment Variables и добавьте ключ BOT_TOKEN")
+    sys.exit(1)
+
+if not CHAT_ID:
+    logger.warning("⚠️ CHAT_ID не найден, используется значение по умолчанию или будет запрошено позже.")
+    # Если нужно жестко требовать CHAT_ID, раскомментируйте строку ниже:
+    # sys.exit(1)
+else:
+    try:
+        CHAT_ID = int(CHAT_ID)
+    except ValueError:
+        logger.error("❌ CHAT_ID должен быть числом (int). Текущее значение: {}".format(CHAT_ID))
+        sys.exit(1)
+
 REF_SHEET_NAME = "СПРАВОЧНИКИ"
 SCHEDULE_SHEET_NAME = "График"
 
-# Глобальная переменная для хранения объекта таблицы
 _spreadsheet_cache = None
 
 # ---------------------------------------------------------
@@ -54,9 +68,6 @@ _spreadsheet_cache = None
 # ---------------------------------------------------------
 
 def init_google_sheets() -> Optional[gspread.Spreadsheet]:
-    """
-    Инициализирует клиент и открывает таблицу.
-    """
     try:
         spreadsheet_id = os.getenv("SPREADSHEET_ID")
         
@@ -67,7 +78,6 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
         creds_json = os.getenv("GOOGLE_CREDENTIALS")
         creds = None
 
-        # Вариант 1: Если весь JSON ключ передан в одной переменной
         if creds_json and creds_json.strip().startswith("{"):
             creds_dict = json.loads(creds_json)
             creds = service_account.Credentials.from_service_account_info(
@@ -78,7 +88,6 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
                 ]
             )
         else:
-            # Вариант 2: Сборка из отдельных переменных
             raw_key = os.getenv("PRIVATE_KEY", "")
             clean_key = raw_key.replace("\\n", "\n")
             
@@ -122,7 +131,6 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
         return None
 
 def get_spreadsheet() -> Optional[gspread.Spreadsheet]:
-    """Возвращает объект таблицы из кэша."""
     global _spreadsheet_cache
     
     if _spreadsheet_cache is None:
@@ -136,20 +144,16 @@ def get_spreadsheet() -> Optional[gspread.Spreadsheet]:
     return _spreadsheet_cache
 
 # ---------------------------------------------------------
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С ИМЕНАМИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (оставлены без изменений)
 # ---------------------------------------------------------
 
 def normalize_name(name_str: str) -> str:
-    """Приводит имя к нижнему регистру, убирает лишние пробелы и точки."""
     if not name_str:
         return ""
     clean = str(name_str).replace(".", "").strip().lower()
     return clean
 
 def match_names(name_in_table: str, name_to_find: str) -> bool:
-    """
-    Сравнивает имена с учетом сокращений.
-    """
     t = normalize_name(name_in_table)
     f = normalize_name(name_to_find)
     
@@ -162,12 +166,9 @@ def match_names(name_in_table: str, name_to_find: str) -> bool:
     if not t_parts or not f_parts:
         return False
 
-    # Проверка фамилии (первое слово)
     if t_parts != f_parts:
         return False
     
-    # Простая логика: если в таблице есть фамилия и имя, а в поиске только фамилия - ок
-    # Или если совпадают первые буквы имен
     if len(t_parts) >= 2 and len(f_parts) >= 2:
         if t_parts == f_parts:
             return True
@@ -175,7 +176,7 @@ def match_names(name_in_table: str, name_to_find: str) -> bool:
     return False
 
 # ---------------------------------------------------------
-# ЛОГИКА ДАННЫХ
+# ЛОГИКА ДАННЫХ (оставлена без изменений)
 # ---------------------------------------------------------
 
 def get_active_managers_for_today() -> List[Dict[str, str]]:
@@ -195,22 +196,18 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
             return []
 
         candidates = []
-        # ИСПРАВЛЕНИЕ: Проходим по строкам правильно, берем ячейки по индексу
         for row in ref_data[1:]:
             if len(row) >= 2:
-                # row - ФИО, row - Username
                 name_val = str(row).strip()
                 username_val = str(row).strip().replace("@", "").lower()
                 
-                # ГЛАВНОЕ ИЗМЕНЕНИЕ:
-                # Если username пустой — сотрудник считается уволенным и НЕ добавляется в список.
                 if name_val and username_val:
                     candidates.append({
                         "full_name": name_val,
                         "username": username_val
                     })
                 elif not username_val and name_val:
-                    logger.debug(f"ℹ️ Сотрудник '{name_val}' исключен: пустой Username (вероятно, уволен).")
+                    logger.debug(f"ℹ️ Сотрудник '{name_val}' исключен: пустой Username.")
 
         if not candidates:
             logger.warning("Нет активных кандидатов с заполненным Username")
@@ -244,7 +241,7 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         schedule_map = {}
         for row in schedule_data[1:]:
             if len(row) > col_idx:
-                name = str(row).strip() # Берем имя из первой колонки
+                name = str(row).strip()
                 val = str(row[col_idx]).strip().lower()
                 is_working = val in ["true", "1", "да", "✓", "✔", "yes", "+", "работает"]
                 schedule_map[name] = is_working
@@ -408,7 +405,6 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         full_name = None
         for row in ref_data[1:]:
             if len(row) >= 2:
-                # ИСПРАВЛЕНИЕ: Берем row для username и row для имени
                 ref_username = str(row).strip().replace("@", "").lower()
                 if ref_username == username.lower():
                     full_name = str(row).strip()
@@ -418,8 +414,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text(
                 f"❌ <b>Вы не найдены в списке менеджеров!</b>\n\n"
                 f"Ваш username: @{username}\n"
-                f"Обратитесь к администратору, чтобы вас добавили в лист '{REF_SHEET_NAME}'.\n"
-                f"Убедитесь, что в таблице username написан точно так же (регистр не важен, но символы должны совпадать).",
+                f"Обратитесь к администратору, чтобы вас добавили в лист '{REF_SHEET_NAME}'.",
                 parse_mode='HTML'
             )
             return
@@ -441,9 +436,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         if not manager_data:
             await query.edit_message_text(
                 f"❌ <b>Ошибка получения данных!</b>\n\n"
-                f"Не удалось найти ваши данные на листе текущего дня.\n"
-                f"Убедитесь, что в таблице создан лист с названием '{get_now_moscow().day}' "
-                f"и вы есть в этом листе.",
+                f"Не удалось найти ваши данные на листе текущего дня.",
                 parse_mode='HTML'
             )
             return
@@ -524,37 +517,15 @@ async def send_reminder(bot):
         logger.error(f"❌ Ошибка в send_reminder: {e}")
 
 # ---------------------------------------------------------
-# ЗАПУСК
+# ЗАПУСК (ИСПРАВЛЕННАЯ ВЕРСИЯ)
 # ---------------------------------------------------------
 
 def main():
-    """Точка входа. Запускает Health Check и бот."""
+    """Точка входа. Запускает только то, что нужно для Render."""
     
-    # 1. Сначала запускаем Health Check сервер в отдельном потоке
-    def run_server():
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, format, *args):
-                pass
-            def do_GET(self):
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"OK")
-            def do_HEAD(self):
-                self.send_response(200)
-                self.end_headers()
+    logger.info("🚀 Инициализация бота...")
 
-        try:
-            port = int(os.getenv("PORT", 10000))
-            server = HTTPServer(('0.0.0.0', port), Handler)
-            logger.info(f"Health check server on port {port}")
-            server.serve_forever()
-        except Exception as e:
-            logger.error(f"Ошибка запуска Health Check: {e}")
-
-    server_thread = threading.Thread(target=run_server, daemon=True)
-    server_thread.start()
-
-    # 2. Инициализация Google Sheets (синхронно перед запуском бота)
+    # 1. Инициализация Google Sheets (синхронно перед запуском бота)
     global _spreadsheet_cache
     _spreadsheet_cache = init_google_sheets()
     
@@ -562,11 +533,7 @@ def main():
         logger.error("❌ Критическая ошибка: не удалось подключиться к Google Sheets. Остановка.")
         sys.exit(1)
 
-    # 3. Создание приложения бота
-    if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN не найден!")
-        sys.exit(1)
-
+    # 2. Создание приложения бота
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
@@ -574,24 +541,24 @@ def main():
     application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="submit_report"))
     application.add_error_handler(error_handler)
 
-    # 4. Настройка планировщика
+    # 3. Настройка планировщика
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(send_reminder, 'cron', hour=14, minute=50, args=[application.bot])
     scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
     scheduler.start()
     logger.info("✅ Планировщик запущен (14:50, 19:30 МСК)")
 
-    # 5. Удаление Webhook (чтобы избежать конфликтов при деплое)
+    # 4. Удаление Webhook (чтобы избежать конфликтов при деплое)
     try:
         application.bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook удалён, все ожидающие обновления сброшены")
     except Exception as e:
         logger.warning(f"Не удалось удалить webhook: {e}")
 
-    # 6. ЗАПУСК БОТА
+    # 5. ЗАПУСК БОТА
     # ВАЖНО: Мы НЕ используем asyncio.run() здесь.
     # application.run_polling() сам управляет своим event loop.
-    # Это исправляет ошибку "RuntimeError: This event loop is already running".
+    # Health Check сервер УДАЛЕН, так как он конфликтовал с Render.
     
     logger.info("🚀 Запуск бота (run_polling)...")
     application.run_polling(
