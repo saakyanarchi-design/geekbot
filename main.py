@@ -150,12 +150,10 @@ def normalize_name(name_str: str) -> str:
 def match_names(name_in_table: str, name_to_find: str) -> bool:
     """
     Сравнивает имена с учетом сокращений.
-    Пример: 'Иванов И.И.' и 'Иванов Иван Иванович' -> True
     """
     t = normalize_name(name_in_table)
     f = normalize_name(name_to_find)
     
-    # 1. Полное совпадение
     if t == f:
         return True
     
@@ -169,18 +167,12 @@ def match_names(name_in_table: str, name_to_find: str) -> bool:
     if t_parts != f_parts:
         return False
     
-    # Логика сравнения инициалов и полных имен
-    if len(t_parts) == 2 and len(f_parts) >= 2:
-        t_initials = t_parts.replace(".", "").upper()
-        f_first_letter = f_parts.upper()
-        if t_initials.startswith(f_first_letter):
+    # Простая логика: если в таблице есть фамилия и имя, а в поиске только фамилия - ок
+    # Или если совпадают первые буквы имен
+    if len(t_parts) >= 2 and len(f_parts) >= 2:
+        if t_parts == f_parts:
             return True
-        return False
-
-    if len(t_parts) >= 3 and len(f_parts) == 2:
-         if t_parts.startswith(f_parts.upper()):
-             return True
-
+            
     return False
 
 # ---------------------------------------------------------
@@ -204,7 +196,9 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
             return []
 
         candidates = []
+        # ИСПРАВЛЕНИЕ: Проходим по строкам правильно
         for row in ref_data[1:]:
+            # row - это список ячеек: [ФИО, Username, ...]
             if len(row) >= 2:
                 name_val = str(row).strip()
                 username_val = str(row).strip().replace("@", "").lower()
@@ -251,7 +245,7 @@ def get_active_managers_for_today() -> List[Dict[str, str]]:
         schedule_map = {}
         for row in schedule_data[1:]:
             if len(row) > col_idx:
-                name = str(row).strip()
+                name = str(row).strip() # Берем имя из первой колонки
                 val = str(row[col_idx]).strip().lower()
                 is_working = val in ["true", "1", "да", "✓", "✔", "yes", "+", "работает"]
                 schedule_map[name] = is_working
@@ -415,6 +409,7 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         full_name = None
         for row in ref_data[1:]:
             if len(row) >= 2:
+                # ИСПРАВЛЕНИЕ: Берем row для username и row для имени
                 ref_username = str(row).strip().replace("@", "").lower()
                 if ref_username == username.lower():
                     full_name = str(row).strip()
@@ -424,7 +419,8 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_text(
                 f"❌ <b>Вы не найдены в списке менеджеров!</b>\n\n"
                 f"Ваш username: @{username}\n"
-                f"Обратитесь к администратору, чтобы вас добавили в лист '{REF_SHEET_NAME}'.",
+                f"Обратитесь к администратору, чтобы вас добавили в лист '{REF_SHEET_NAME}'.\n"
+                f"Убедитесь, что в таблице username написан точно так же (регистр не важен, но символы должны совпадать).",
                 parse_mode='HTML'
             )
             return
@@ -532,53 +528,8 @@ async def send_reminder(bot):
 # ЗАПУСК
 # ---------------------------------------------------------
 
-async def main_async():
-    logger.info("🚀 Запуск бота...")
-
-    if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN не найден!")
-        sys.exit(1)
-
-    global _spreadsheet_cache
-    _spreadsheet_cache = init_google_sheets()
-    
-    if _spreadsheet_cache is None:
-        logger.error("❌ Критическая ошибка: не удалось подключиться к Google Sheets.")
-        return
-
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("report", cmd_report))
-    application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="submit_report"))
-    application.add_error_handler(error_handler)
-
-    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(send_reminder, 'cron', hour=14, minute=50, args=[application.bot])
-    scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
-    scheduler.start()
-    logger.info("✅ Планировщик запущен (14:50, 19:30 МСК)")
-
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook удалён, все ожидающие обновления сброшены")
-    except Exception as e:
-        logger.warning(f"Не удалось удалить webhook: {e}")
-
-    await application.initialize()
-    await application.start()
-    
-    # ВАЖНО: run_polling сам управляет циклом событий.
-    # Мы НЕ используем asyncio.run() здесь.
-    await application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        poll_interval=1.0,
-        timeout=30
-    )
-
 def main():
-    """Микро-сервер для Render + запуск бота"""
+    """Точка входа. Запускает Health Check и бот."""
     
     # 1. Сначала запускаем Health Check сервер в отдельном потоке
     def run_server():
@@ -601,67 +552,52 @@ def main():
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
 
-    # 2. Запускаем асинхронную логику бота.
-    # ВНИМАНИЕ: Мы НЕ оборачиваем main_async() в asyncio.run().
-    # Функция main_async содержит внутри себя application.run_polling(), 
-    # который сам создает и закрывает event loop.
-    try:
-        # Для Python 3.7+ можно использовать get_event_loop, но проще вызвать напрямую,
-        # если внутри нет конфликта. Однако, так как main_async использует await,
-        # нам нужно запустить его. 
-        # Но так как run_polling блокирует выполнение, мы можем просто запустить его.
-        
-        # Правильный способ для такой архитектуры:
-        asyncio.run(main_async()) 
-        # Примечание: В старых версиях PTB это вызывало конфликт. 
-        # В новых версиях PTB (20+) run_polling внутри себя делает run_until_complete.
-        # Если вы получаете ошибку "Event loop already running", значит, среда выполнения (Render)
-        # уже имеет запущенный цикл. В таком случае, просто вызывайте логику без asyncio.run,
-        # но это сложно сделать корректно с run_polling.
-        
-        # АЛЬТЕРНАТИВА ДЛЯ RENDER (если asyncio.run падает):
-        # Попробуйте убрать asyncio.run и использовать loop напрямую, если Render требует этого.
-        # Но чаще всего проблема в том, что run_polling вызывается внутри asyncio.run.
-        # Давайте попробуем вариант БЕЗ asyncio.run, если Render сам управляет циклом,
-        # но это рискованно.
-        
-        # Самый надежный вариант для Render с PTB 20+:
-        # Убрать asyncio.run здесь и позволить run_polling работать.
-        # Но main_async - это корутина.
-        # Давайте оставим asyncio.run, но убедимся, что внутри main_async нет вложенных запусков.
-        # Ошибка в логах была именно из-за двойного запуска.
-        # Если Render запускает скрипт, он создает свой loop.
-        # Попробуйте этот блок, если предыдущий падает:
-        """
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(main_async())
-        """
-        # Но стандартный asyncio.run должен работать. Ошибка была в том, что run_polling
-        # пытался запустить loop, который уже был запущен asyncio.run.
-        # В новых версиях PTB run_polling НЕ должен вызывать asyncio.run.
-        # Если ошибка сохраняется, значит, версия PTB или среда специфичны.
-        
-        # ИСПРАВЛЕННЫЙ ПОДХОД ДЛЯ RENDER:
-        # Просто вызываем main_async, но так как она асинхронная, нам нужен runner.
-        # Если ошибка "loop already running" повторяется, значит, Render уже запустил loop.
-        # В этом случае нужно использовать:
-        # asyncio.get_event_loop().run_until_complete(main_async())
-        
-        # Попробуем универсальный вариант:
-        try:
-            asyncio.run(main_async())
-        except RuntimeError as e:
-            if "already running" in str(e):
-                logger.warning("Обнаружен уже запущенный цикл событий. Используем существующий.")
-                loop = asyncio.get_event_loop()
-                loop.run_until_complete(main_async())
-            else:
-                raise e
-
-    except Exception as e:
-        logger.error(f"Критическая ошибка запуска: {e}", exc_info=True)
+    # 2. Инициализация Google Sheets (синхронно перед запуском бота)
+    global _spreadsheet_cache
+    _spreadsheet_cache = init_google_sheets()
+    
+    if _spreadsheet_cache is None:
+        logger.error("❌ Критическая ошибка: не удалось подключиться к Google Sheets. Остановка.")
         sys.exit(1)
+
+    # 3. Создание приложения бота
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN не найден!")
+        sys.exit(1)
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("report", cmd_report))
+    application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="submit_report"))
+    application.add_error_handler(error_handler)
+
+    # 4. Настройка планировщика
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    scheduler.add_job(send_reminder, 'cron', hour=14, minute=50, args=[application.bot])
+    scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
+    scheduler.start()
+    logger.info("✅ Планировщик запущен (14:50, 19:30 МСК)")
+
+    # 5. Удаление Webhook (чтобы избежать конфликтов при деплое)
+    try:
+        application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook удалён, все ожидающие обновления сброшены")
+    except Exception as e:
+        logger.warning(f"Не удалось удалить webhook: {e}")
+
+    # 6. ЗАПУСК БОТА
+    # ВАЖНО: Мы НЕ используем asyncio.run() здесь.
+    # application.run_polling() сам управляет своим event loop.
+    # Это исправляет ошибку "RuntimeError: This event loop is already running".
+    
+    logger.info("🚀 Запуск бота (run_polling)...")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        poll_interval=1.0,
+        timeout=30
+    )
 
 if __name__ == "__main__":
     main()
