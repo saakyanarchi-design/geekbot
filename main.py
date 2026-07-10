@@ -60,7 +60,7 @@ _spreadsheet_cache = None
 _gs_lock = asyncio.Lock()
 
 # ---------------------------------------------------------
-# GOOGLE SHEETS: АВТОРИЗАЦИЯ
+# GOOGLE SHEETS: АВТОРИЗАЦИЯ (ИСПРАВЛЕНО)
 # ---------------------------------------------------------
 def init_google_sheets() -> Optional[gspread.Spreadsheet]:
     try:
@@ -68,42 +68,33 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
             logger.error("❌ Переменная SPREADSHEET_ID не задана!")
             return None
 
-        creds = None
+        # ✅ ТОЛЬКО GOOGLE_CREDENTIALS — одна переменная со всем JSON
         creds_json = os.getenv("GOOGLE_CREDENTIALS")
 
-        if creds_json and creds_json.strip().startswith("{"):
-            creds_dict = json.loads(creds_json)
-            creds = service_account.Credentials.from_service_account_info(
-                creds_dict,
-                scopes=[
-                    "https://www.googleapis.com/auth/spreadsheets",
-                    "https://www.googleapis.com/auth/drive.file"
-                ]
-            )
-        else:
-            raw_key = os.getenv("PRIVATE_KEY", "")
-            clean_key = raw_key.replace("\\n", "\n")
+        if not creds_json:
+            logger.error("❌ Переменная GOOGLE_CREDENTIALS пуста!")
+            return None
 
-            creds_dict = {
-                "type": "service_account",
-                "project_id": os.getenv("PROJECT_ID"),
-                "private_key_id": os.getenv("PRIVATE_KEY_ID"),
-                "private_key": clean_key,
-                "client_email": os.getenv("CLIENT_EMAIL"),
-                "client_id": os.getenv("CLIENT_ID"),
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-                "client_x509_cert_url": os.getenv("CLIENT_CERT_URL")
-            }
+        if not creds_json.strip().startswith("{"):
+            logger.error("❌ GOOGLE_CREDENTIALS не является JSON-объектом (должен начинаться с '{')")
+            return None
 
-            creds = service_account.Credentials.from_service_account_info(
-                creds_dict,
-                scopes=[
-                    "https://www.googleapis.com/auth/spreadsheets",
-                    "https://www.googleapis.com/auth/drive.file"
-                ]
-            )
+        creds_dict = json.loads(creds_json)
+
+        # Проверим, что все обязательные поля есть
+        required_fields = ["client_email", "token_uri", "private_key", "project_id"]
+        missing_fields = [f for f in required_fields if f not in creds_dict]
+        if missing_fields:
+            logger.error(f"❌ В GOOGLE_CREDENTIALS отсутствуют поля: {missing_fields}")
+            return None
+
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive.file"
+            ]
+        )
 
         if not creds:
             logger.error("❌ Не удалось создать credentials")
@@ -116,6 +107,9 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
         logger.info(f"✅ Таблица успешно подключена: {spreadsheet.title}")
         return spreadsheet
 
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Ошибка парсинга JSON в GOOGLE_CREDENTIALS: {e}")
+        return None
     except gspread.exceptions.SpreadsheetNotFound:
         logger.error(f"❌ Таблица с ID {SPREADSHEET_ID} не найдена.")
         return None
