@@ -1,6 +1,6 @@
-python-telegram-bot==20.7
-gspread
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-apscheduler
+python-telegram-bot==21.0
+gspread==6.1.0
+google-auth==2.29.0
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+apscheduler==3.10.4
