@@ -12,13 +12,13 @@ import gspread
 from google.oauth2 import service_account
 import json
 
+# ✅ ИСПРАВЛЕНО: Update импортируется из telegram, а не telegram.ext
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes,
-    Update
+    ContextTypes
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -173,8 +173,8 @@ async def get_active_managers_for_today() -> List[Dict[str, str]]:
         candidates = []
         for row in ref_data[1:]:
             if len(row) >= 2:
-                name_val = str(row).strip()
-                username_val = str(row).strip().replace("@", "").lower()
+                name_val = str(row[0]).strip()
+                username_val = str(row[1]).strip().replace("@", "").lower()
                 if name_val and username_val:
                     candidates.append({"full_name": name_val, "username": username_val})
 
@@ -191,7 +191,7 @@ async def get_active_managers_for_today() -> List[Dict[str, str]]:
 
         now = get_now_moscow()
         today_str = str(now.day)
-        header = schedule_data if schedule_data else []
+        header = schedule_data[0] if schedule_data else []
 
         col_idx = -1
         for i, val in enumerate(header):
@@ -206,7 +206,7 @@ async def get_active_managers_for_today() -> List[Dict[str, str]]:
         schedule_map = {}
         for row in schedule_data[1:]:
             if len(row) > col_idx:
-                name = str(row).strip()
+                name = str(row[0]).strip()
                 val = str(row[col_idx]).strip().lower()
                 is_working = val in ["true", "1", "да", "✓", "✔", "yes", "+", "работает"]
                 schedule_map[name] = is_working
@@ -257,7 +257,7 @@ async def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
         row_num = None
         for i, row in enumerate(all_data):
             if row and len(row) > 0:
-                if match_names(str(row).strip(), full_name):
+                if match_names(str(row[0]).strip(), full_name):
                     row_num = i
                     break
 
@@ -337,9 +337,9 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
 
         for row in ref_data[1:]:
             if len(row) >= 2:
-                ref_username = str(row).strip().replace("@", "").lower()
+                ref_username = str(row[1]).strip().replace("@", "").lower()
                 if ref_username == username.lower():
-                    full_name = str(row).strip()
+                    full_name = str(row[0]).strip()
                     break
 
         if not full_name:
