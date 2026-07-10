@@ -378,24 +378,30 @@ async def send_reminder(bot):
         logger.error(f"❌ Ошибка отправки напоминания: {e}")
 
 # ---------------------------------------------------------
-# HEALTH CHECK СЕРВЕР ДЛЯ RENDER
+# WEBHOOK / POLLING / HEALTH CHECK
 # ---------------------------------------------------------
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+from aiohttp import web
 
-def run_health_server():
-    port = int(os.environ.get("PORT", 10000))
-    httpd = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    httpd.serve_forever()
+async def health_check(request):
+    return web.Response(text="OK", status=200)
 
-# ---------------------------------------------------------
-# ЗАПУСК
-# ---------------------------------------------------------
-async def main_async():
-    """Основная асинхронная функция"""
+async def on_startup(app):
+    logger.info("✅ Бот запускается...")
+    # Запускаем планировщик в фоне
+    scheduler = AsyncIOScheduler(timezone=TZ_MOSCOW)
+    scheduler.add_job(send_reminder, 'cron', hour=14, minute=50, args=[app['bot']])
+    scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[app['bot']])
+    scheduler.start()
+    app['scheduler'] = scheduler
+    logger.info("✅ Планировщик запущен (напоминания: 14:50 и 19:30)")
+
+async def on_shutdown(app):
+    scheduler = app.get('scheduler')
+    if scheduler:
+        scheduler.shutdown()
+    logger.info("✅ Планировщик остановлен")
+
+async def main():
     logger.info("🤖 Инициализация приложения бота...")
 
     application = Application.builder().token(BOT_TOKEN).build()
@@ -405,34 +411,51 @@ async def main_async():
     application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="^submit_report$"))
     application.add_error_handler(error_handler)
 
-    # Запускаем планировщик
-    scheduler = AsyncIOScheduler(timezone=TZ_MOSCOW)
-    scheduler.add_job(send_reminder, 'cron', hour=14, minute=50, args=[application.bot])
-    scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
-    scheduler.start()
-    logger.info("✅ Планировщик запущен (напоминания: 14:50 и 19:30)")
+    # Настройка веб-приложения для Render aiohttp
+    web_app = web.Application()
+    web_app.router.add_get('/', health_check)
+    web_app.router.add_get('/health', health_check)
 
-    logger.info("🚀 Запуск бота в режиме polling...")
+    # Привязываем бота к приложению
+    web_app['bot'] = application.bot
+    web_app.on_startup.append(on_startup)
+    web_app.on_shutdown.append(on_shutdown)
 
-    # Явно запускаем polling вручную
+    # Настраиваем webhook
     await application.initialize()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    await application.start()
+
+    # Получаем внешний URL от Render или используем localhost
+    WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
+    if WEBHOOK_URL:
+        # Если есть внешний URL, используем webhook
+        WEBHOOK_PATH = "/webhook"
+        await application.bot.set_webhook(url=f"{WEBHOOK_URL}{WEBHOOK_PATH}")
+        web_app.router.add_post(WEBHOOK_PATH, lambda request: application.process_update(
+            Update.de_json(await request.json(), application.bot)
+        ))
+        logger.info(f"🌐 Webhook установлен на {WEBHOOK_URL}{WEBHOOK_PATH}")
+    else:
+        # Иначе запускаем polling
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("🔄 Запущен polling (без webhook)")
+
+    # Запускаем aiohttp сервер
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    PORT = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+
+    logger.info(f"🚀 HTTP сервер запущен на порту {PORT}")
 
     # Держим процесс живым
     while True:
         await asyncio.sleep(3600)
 
-def main():
-    """Точка входа — синхронная функция"""
-    threading.Thread(target=run_health_server, daemon=True).start()
-
+if __name__ == "__main__":
     try:
-        asyncio.run(main_async())
+        asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем")
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}", exc_info=True)
-
-if __name__ == "__main__":
-    main()
