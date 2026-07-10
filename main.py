@@ -5,6 +5,8 @@ import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 import gspread
 from google.oauth2 import service_account
@@ -54,7 +56,7 @@ REF_SHEET_NAME = "СПРАВОЧНИКИ"
 SCHEDULE_SHEET_NAME = "График"
 
 _spreadsheet_cache = None
-_gs_lock = asyncio.Lock()  # Блокировка для безопасного доступа к Google Sheets
+_gs_lock = asyncio.Lock()
 
 # ---------------------------------------------------------
 # GOOGLE SHEETS: АВТОРИЗАЦИЯ
@@ -80,7 +82,7 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
         else:
             raw_key = os.getenv("PRIVATE_KEY", "")
             clean_key = raw_key.replace("\\n", "\n")
-            
+
             creds_dict = {
                 "type": "service_account",
                 "project_id": os.getenv("PROJECT_ID"),
@@ -93,7 +95,7 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
                 "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
                 "client_x509_cert_url": os.getenv("CLIENT_CERT_URL")
             }
-            
+
             creds = service_account.Credentials.from_service_account_info(
                 creds_dict,
                 scopes=[
@@ -108,7 +110,7 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
 
         client = gspread.authorize(creds)
         logger.info(f"📂 Подключение к таблице по ID: {SPREADSHEET_ID[:10]}...")
-        
+
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
         logger.info(f"✅ Таблица успешно подключена: {spreadsheet.title}")
         return spreadsheet
@@ -122,7 +124,6 @@ def init_google_sheets() -> Optional[gspread.Spreadsheet]:
 
 async def get_spreadsheet() -> Optional[gspread.Spreadsheet]:
     global _spreadsheet_cache
-    # Используем блокировку, чтобы не создавать 100 подключений одновременно
     async with _gs_lock:
         if _spreadsheet_cache is None:
             logger.info("🔄 Инициализация клиента Google Sheets...")
@@ -171,8 +172,8 @@ async def get_active_managers_for_today() -> List[Dict[str, str]]:
         candidates = []
         for row in ref_data[1:]:
             if len(row) >= 2:
-                name_val = str(row).strip()
-                username_val = str(row).strip().replace("@", "").lower()
+                name_val = str(row[0]).strip()
+                username_val = str(row[1]).strip().replace("@", "").lower()
                 if name_val and username_val:
                     candidates.append({"full_name": name_val, "username": username_val})
 
@@ -189,14 +190,14 @@ async def get_active_managers_for_today() -> List[Dict[str, str]]:
 
         now = get_now_moscow()
         today_str = str(now.day)
-        header = schedule_data if schedule_data else []
-        
+        header = schedule_data[0] if schedule_data else []
+
         col_idx = -1
         for i, val in enumerate(header):
             if str(val).strip() == today_str:
                 col_idx = i
                 break
-        
+
         if col_idx == -1:
             logger.warning(f"Колонка даты {today_str} не найдена. Заголовки: {header}")
             return []
@@ -204,7 +205,7 @@ async def get_active_managers_for_today() -> List[Dict[str, str]]:
         schedule_map = {}
         for row in schedule_data[1:]:
             if len(row) > col_idx:
-                name = str(row).strip()
+                name = str(row[0]).strip()
                 val = str(row[col_idx]).strip().lower()
                 is_working = val in ["true", "1", "да", "✓", "✔", "yes", "+", "работает"]
                 schedule_map[name] = is_working
@@ -246,7 +247,7 @@ async def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
                 break
             except gspread.exceptions.WorksheetNotFound:
                 continue
-        
+
         if not day_sheet: return None
 
         all_data = day_sheet.get_all_values()
@@ -255,14 +256,14 @@ async def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
         row_num = None
         for i, row in enumerate(all_data):
             if row and len(row) > 0:
-                if match_names(str(row).strip(), full_name):
+                if match_names(str(row[0]).strip(), full_name):
                     row_num = i
                     break
-        
+
         if row_num is None: return None
 
         target = all_data[row_num]
-        
+
         return {
             "full_name": full_name, 
             "leads": get_cell_value(target, 1), 
@@ -332,12 +333,12 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
         ref_sheet = spreadsheet.worksheet(REF_SHEET_NAME)
         ref_data = ref_sheet.get_all_values()
         full_name = None
-        
+
         for row in ref_data[1:]:
             if len(row) >= 2:
-                ref_username = str(row).strip().replace("@", "").lower()
+                ref_username = str(row[1]).strip().replace("@", "").lower()
                 if ref_username == username.lower():
-                    full_name = str(row).strip()
+                    full_name = str(row[0]).strip()
                     break
 
         if not full_name:
@@ -381,23 +382,32 @@ async def send_reminder(bot):
     except Exception as e:
         logger.error(f"❌ Ошибка отправки напоминания: {e}")
 
-async def start_scheduler(application):
-    """Запускает планировщик в том же event loop, что и бот"""
-    scheduler = AsyncIOScheduler(timezone=TZ_MOSCOW)
-    
-    # Задачи планировщика
-    scheduler.add_job(send_reminder, 'cron', hour=14, minute=50, args=[application.bot])
-    scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
-    
-    scheduler.start()
-    logger.info("✅ Планировщик запущен (напоминания: 14:50 и 19:30)")
+# ---------------------------------------------------------
+# ПРОСТОЙ HTTP-СЕРВЕР ДЛЯ RENDER (чтобы не было ошибки "port binding required")
+# ---------------------------------------------------------
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    logger.info(f"✅ Health check сервер запущен на порту {port}")
+    server.serve_forever()
 
 # ---------------------------------------------------------
 # ЗАПУСК
 # ---------------------------------------------------------
-async def main():
+def main():
     """Запуск бота"""
     logger.info("🤖 Инициализация приложения бота...")
+
+    # Запускаем health check сервер в отдельном потоке (требование Render для Web Service)
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -406,7 +416,7 @@ async def main():
     application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="^submit_report$"))
     application.add_error_handler(error_handler)
 
-    # Запускаем планировщик
+    # Запускаем планировщик в том же event loop
     scheduler = AsyncIOScheduler(timezone=TZ_MOSCOW)
     scheduler.add_job(send_reminder, 'cron', hour=14, minute=50, args=[application.bot])
     scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
@@ -418,4 +428,3 @@ async def main():
 
 if __name__ == "__main__":
     main()
-
