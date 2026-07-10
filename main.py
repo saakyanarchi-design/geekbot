@@ -395,27 +395,27 @@ async def start_scheduler(application):
 # ---------------------------------------------------------
 # ЗАПУСК
 # ---------------------------------------------------------
-async def main_async():
+async def main():
+    """Запуск бота"""
     logger.info("🤖 Инициализация приложения бота...")
-    
+
     application = Application.builder().token(BOT_TOKEN).build()
-    
+
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("report", cmd_report))
-    # ИСПРАВЛЕНО: raw string для паттерна
-    application.add_handler(CallbackQueryHandler(process_callback_submit, pattern=r"^submit_report\$"))
+    application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="^submit_report$"))
     application.add_error_handler(error_handler)
 
-    # Запускаем планировщик асинхронно ПЕРЕД запуском polling
-    await start_scheduler(application)
+    # Запускаем планировщик
+    scheduler = AsyncIOScheduler(timezone=TZ_MOSCOW)
+    scheduler.add_job(send_reminder, 'cron', hour=14, minute=50, args=[application.bot])
+    scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
+    scheduler.start()
+    logger.info("✅ Планировщик запущен (напоминания: 14:50 и 19:30)")
 
     logger.info("🚀 Запуск бота в режиме polling...")
-    # run_polling сам управляет своим Event Loop
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-def main():
-    # Просто запускаем асинхронную функцию
-    asyncio.run(main_async())
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
+
