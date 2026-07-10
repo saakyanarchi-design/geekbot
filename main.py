@@ -2,11 +2,11 @@ import os
 import sys
 import logging
 import asyncio
+import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
 
 import gspread
 from google.oauth2 import service_account
@@ -17,7 +17,8 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes
+    ContextTypes,
+    Update
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -172,8 +173,8 @@ async def get_active_managers_for_today() -> List[Dict[str, str]]:
         candidates = []
         for row in ref_data[1:]:
             if len(row) >= 2:
-                name_val = str(row[0]).strip()
-                username_val = str(row[1]).strip().replace("@", "").lower()
+                name_val = str(row).strip()
+                username_val = str(row).strip().replace("@", "").lower()
                 if name_val and username_val:
                     candidates.append({"full_name": name_val, "username": username_val})
 
@@ -190,7 +191,7 @@ async def get_active_managers_for_today() -> List[Dict[str, str]]:
 
         now = get_now_moscow()
         today_str = str(now.day)
-        header = schedule_data[0] if schedule_data else []
+        header = schedule_data if schedule_data else []
 
         col_idx = -1
         for i, val in enumerate(header):
@@ -205,7 +206,7 @@ async def get_active_managers_for_today() -> List[Dict[str, str]]:
         schedule_map = {}
         for row in schedule_data[1:]:
             if len(row) > col_idx:
-                name = str(row[0]).strip()
+                name = str(row).strip()
                 val = str(row[col_idx]).strip().lower()
                 is_working = val in ["true", "1", "да", "✓", "✔", "yes", "+", "работает"]
                 schedule_map[name] = is_working
@@ -256,7 +257,7 @@ async def get_manager_day_data(full_name: str) -> Optional[Dict[str, str]]:
         row_num = None
         for i, row in enumerate(all_data):
             if row and len(row) > 0:
-                if match_names(str(row[0]).strip(), full_name):
+                if match_names(str(row).strip(), full_name):
                     row_num = i
                     break
 
@@ -336,9 +337,9 @@ async def process_callback_submit(update: Update, context: ContextTypes.DEFAULT_
 
         for row in ref_data[1:]:
             if len(row) >= 2:
-                ref_username = str(row[1]).strip().replace("@", "").lower()
+                ref_username = str(row).strip().replace("@", "").lower()
                 if ref_username == username.lower():
-                    full_name = str(row[0]).strip()
+                    full_name = str(row).strip()
                     break
 
         if not full_name:
@@ -383,31 +384,25 @@ async def send_reminder(bot):
         logger.error(f"❌ Ошибка отправки напоминания: {e}")
 
 # ---------------------------------------------------------
-# ПРОСТОЙ HTTP-СЕРВЕР ДЛЯ RENDER (чтобы не было ошибки "port binding required")
+# HEALTH CHECK СЕРВЕР ДЛЯ RENDER
 # ---------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Bot is running!")
+        self.wfile.write(b"OK")
 
 def run_health_server():
-    port = int(os.environ.get("PORT", 8000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    logger.info(f"✅ Health check сервер запущен на порту {port}")
-    server.serve_forever()
+    port = int(os.environ.get("PORT", 10000))
+    httpd = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    httpd.serve_forever()
 
 # ---------------------------------------------------------
 # ЗАПУСК
 # ---------------------------------------------------------
-def main():
-    """Запуск бота"""
+async def main_async():
+    """Основная асинхронная функция"""
     logger.info("🤖 Инициализация приложения бота...")
-
-    # Запускаем health check сервер в отдельном потоке (требование Render для Web Service)
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -416,7 +411,7 @@ def main():
     application.add_handler(CallbackQueryHandler(process_callback_submit, pattern="^submit_report$"))
     application.add_error_handler(error_handler)
 
-    # Запускаем планировщик в том же event loop
+    # Запускаем планировщик
     scheduler = AsyncIOScheduler(timezone=TZ_MOSCOW)
     scheduler.add_job(send_reminder, 'cron', hour=14, minute=50, args=[application.bot])
     scheduler.add_job(send_reminder, 'cron', hour=19, minute=30, args=[application.bot])
@@ -424,7 +419,26 @@ def main():
     logger.info("✅ Планировщик запущен (напоминания: 14:50 и 19:30)")
 
     logger.info("🚀 Запуск бота в режиме polling...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # Явно запускаем polling вручную
+    await application.initialize()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await application.start()
+
+    # Держим процесс живым
+    while True:
+        await asyncio.sleep(3600)
+
+def main():
+    """Точка входа — синхронная функция"""
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
